@@ -1,7 +1,7 @@
 {
   "schema": "fastmcp-maintenance/1",
   "publisher": "fastmcp-actions",
-  "as_of": "2026-09-27T13:10:16Z",
+  "as_of": "2026-09-27T21:10:13Z",
   "automations": [
     {
       "id": "issue-link-gate",
@@ -15,7 +15,7 @@
       "window": "7d",
       "counts": {
         "passed": 85,
-        "blocked": 35
+        "blocked": 41
       }
     },
     {
@@ -29,7 +29,7 @@
       "evidence_url": "https://github.com/PrefectHQ/fastmcp/actions/workflows/marvin-label-triage.yml",
       "window": "7d",
       "counts": {
-        "succeeded": 122,
+        "succeeded": 132,
         "failed": 2
       }
     },
@@ -44,7 +44,7 @@
       "evidence_url": "https://github.com/PrefectHQ/fastmcp/actions/workflows/marvin-dedupe-issues.yml",
       "window": "7d",
       "counts": {
-        "succeeded": 32,
+        "succeeded": 36,
         "failed": 0
       }
     },
@@ -84,13 +84,13 @@
       "what": "explains failed test and static-analysis runs on pull requests",
       "cadence": "after each failed PR run",
       "runs_on": "github-actions",
-      "state": "ok",
+      "state": "degraded",
       "last_ok_day": "2026-09-27",
       "evidence_url": "https://github.com/PrefectHQ/fastmcp/actions/workflows/marvin-test-failure.yml",
       "window": "7d",
       "counts": {
-        "succeeded": 439,
-        "failed": 11
+        "succeeded": 440,
+        "failed": 12
       }
     },
     {
@@ -164,7 +164,7 @@
       "evidence_url": "https://github.com/PrefectHQ/fastmcp/pulls?q=is%3Apr+is%3Aopen+label%3Amissing-issue-link",
       "window": "now",
       "counts": {
-        "waiting": 37,
+        "waiting": 43,
         "oldest_days": 27,
         "waiting_over_7_days": 15
       }
