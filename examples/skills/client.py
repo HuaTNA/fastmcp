@@ -1,65 +1,30 @@
-"""Example: Skills Client
-
-This example shows how to discover and download skills from a skills server.
-
-Run this client (it starts its own server internally):
-    uv run python examples/skills/client.py
-"""
+"""Discover skills and read content with manifest verification."""
 
 import asyncio
-import json
 from pathlib import Path
 
-from fastmcp import Client
+from fastmcp import Client, FastMCP
 from fastmcp.server.providers.skills import SkillsDirectoryProvider
+from fastmcp.server.skills import SkillsExtension
 
 
-async def main():
-    # Create a skills provider pointing at our sample skills
+async def main() -> None:
     skills_dir = Path(__file__).parent / "sample_skills"
-    provider = SkillsDirectoryProvider(roots=skills_dir)
+    server = FastMCP("Skills Server")
+    server.add_provider(SkillsDirectoryProvider(skills_dir))
+    server.add_extension(SkillsExtension())
 
-    # Connect to a FastMCP server with this provider
-    from fastmcp import FastMCP
+    async with Client(server) as client:
+        for skill in await client.list_skills():
+            print(f"{skill.name}: {skill.description}")
+            instructions = await skill.read()
+            print(instructions.text[:500])
 
-    mcp = FastMCP("Skills Server")
-    mcp.add_provider(provider)
-
-    async with Client(mcp) as client:
-        print("Connected to skills server\n")
-
-        # List available resources
-        print("=== Available Resources ===")
-        resources = await client.list_resources()
-        for r in resources:
-            print(f"  {r.uri}")
-            if r.description:
-                print(f"    Description: {r.description}")
-        print()
-
-        # List resource templates
-        print("=== Resource Templates ===")
-        templates = await client.list_resource_templates()
-        for t in templates:
-            print(f"  {t.uri_template}")
-        print()
-
-        # Read a skill's main file
-        print("=== Reading pdf-processing/SKILL.md ===")
-        result = await client.read_resource("skill://pdf-processing/SKILL.md")
-        print(result[0].text[:500] + "...\n")
-
-        # Read the manifest to see all files
-        print("=== Reading pdf-processing/_manifest ===")
-        result = await client.read_resource("skill://pdf-processing/_manifest")
-        manifest = json.loads(result[0].text)
-        print(json.dumps(manifest, indent=2))
-        print()
-
-        # Read a supporting file via template
-        print("=== Reading pdf-processing/reference.md ===")
-        result = await client.read_resource("skill://pdf-processing/reference.md")
-        print(result[0].text[:500] + "...\n")
+            if skill.resources != "dynamic":
+                for file in skill.resources:
+                    if file.uri.endswith("/reference.md"):
+                        reference = await skill.read("reference.md")
+                        print(reference.text[:500])
 
 
 if __name__ == "__main__":

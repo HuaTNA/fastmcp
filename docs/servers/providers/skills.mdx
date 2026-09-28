@@ -1,304 +1,137 @@
 ---
-title: Skills Provider
+title: Skills
 sidebarTitle: Skills
-description: Expose agent skills as MCP resources
+description: Publish and retrieve software-defined skills over MCP
 icon: wand-magic-sparkles
 ---
 
-import { VersionBadge } from '/snippets/version-badge.mdx'
+FastMCP implements the MCP Skills extension. A `Skill` is an immutable, storage-neutral bundle of instructions and files. Providers publish those bundles as resources, while `SkillsExtension` adds the protocol methods that let clients discover a skill and retrieve its verified content.
 
-<VersionBadge version="3.0.0" />
+## Publish skills
 
-Agent skills are directories containing instructions and supporting files that teach an AI assistant how to perform specific tasks. Tools like Claude Code, Cursor, and VS Code Copilot each have their own skills directories where users can add custom capabilities. The Skills Provider exposes these skill directories as MCP resources, making skills discoverable and shareable across different AI tools and clients.
-
-## Why Skills as Resources
-
-Skills live in platform-specific directories (`~/.claude/skills/`, `~/.cursor/skills/`, etc.) and typically contain a main instruction file plus supporting reference materials. When you want to share skills between tools or access them from a custom client, you need a way to discover and retrieve these files programmatically.
-
-The Skills Provider solves this by exposing each skill as a set of MCP resources. A client can list available skills, read the main instruction file, check the manifest to see what supporting files exist, and fetch any file it needs. This transforms local skill directories into a standardized API that works with any MCP client.
-
-## Quick Start
-
-Create a provider pointing to your skills directory, then add it to your server.
+Create a skill in Python when its content belongs in your application, or load a snapshot from one skill directory. Loading a directory reads it once; later disk changes do not alter the `Skill` object.
 
 ```python
-from pathlib import Path
-
-from fastmcp import FastMCP
-from fastmcp.server.providers.skills import SkillsDirectoryProvider
-
-mcp = FastMCP("Skills Server")
-mcp.add_provider(SkillsDirectoryProvider(roots=Path.home() / ".claude" / "skills"))
-```
-
-Each subdirectory containing a `SKILL.md` file becomes a discoverable skill. Clients can then list resources to see available skills and read them as needed.
-
-```python
-from fastmcp import Client
-
-async with Client(mcp) as client:
-    # List each skill's main file and manifest
-    resources = await client.list_resources()
-    for r in resources:
-        print(r.uri)  # skill://my-skill/SKILL.md, skill://my-skill/_manifest
-
-    # Read a skill's main instruction file
-    result = await client.read_resource("skill://my-skill/SKILL.md")
-    print(result[0].text)
-```
-
-## Skill Structure
-
-A skill is a directory containing a main instruction file (default: `SKILL.md`) and optionally supporting files. The directory name becomes the skill's identifier.
-
-```
-~/.claude/skills/
-├── pdf-processing/
-│   ├── SKILL.md           # Main instructions
-│   ├── reference.md       # Supporting documentation
-│   └── examples/
-│       └── sample.pdf
-└── code-review/
-    └── SKILL.md
-```
-
-The main file can include YAML frontmatter to provide metadata. If no frontmatter exists, the provider extracts a description from the first meaningful line of content.
-
-```markdown
----
-description: Process and extract information from PDF documents
----
-
-# PDF Processing
-
-Instructions for handling PDFs...
-```
-
-## Resource URIs
-
-Each skill exposes three types of resources, all using the `skill://` URI scheme.
-
-The main instruction file contains the primary skill content. This is the resource clients read to understand what a skill does and how to use it.
-
-```
-skill://pdf-processing/SKILL.md
-```
-
-The manifest is a synthetic JSON resource listing all files in the skill directory with their sizes and SHA256 hashes. Clients use this to discover supporting files and verify content integrity.
-
-```
-skill://pdf-processing/_manifest
-```
-
-Reading the manifest returns structured file information.
-
-```json
-{
-  "skill": "pdf-processing",
-  "files": [
-    {"path": "SKILL.md", "size": 1234, "hash": "sha256:abc123..."},
-    {"path": "reference.md", "size": 567, "hash": "sha256:def456..."},
-    {"path": "examples/sample.pdf", "size": 89012, "hash": "sha256:ghi789..."}
-  ]
-}
-```
-
-Supporting files are any additional files in the skill directory. These might be reference documentation, code examples, or binary assets.
-
-```
-skill://pdf-processing/reference.md
-skill://pdf-processing/examples/sample.pdf
-```
-
-<Note>
-Supporting-file access is confined to the skill directory. Requested paths are validated before any filesystem access: attempts to traverse out with `..`, inject an absolute path, or smuggle a null byte are rejected with a clear error, and symlinks that resolve outside the skill directory are refused.
-</Note>
-
-## Provider Architecture
-
-The Skills Provider uses a two-layer architecture to handle both single skills and skill directories.
-
-### SkillProvider
-
-`SkillProvider` handles a single skill directory. It loads the main file, parses any frontmatter, scans for supporting files, and creates the appropriate resources.
-
-```python
-from pathlib import Path
-
-from fastmcp import FastMCP
+from fastmcp import FastMCP, Skill
 from fastmcp.server.providers.skills import SkillProvider
+from fastmcp.server.skills import SkillsExtension
 
-mcp = FastMCP("Single Skill")
-mcp.add_provider(SkillProvider(Path.home() / ".claude" / "skills" / "pdf-processing"))
+skill = Skill(
+    name="refunds",
+    description="Help support staff handle refund requests.",
+    instructions="Check the order date and payment status before issuing a refund.",
+    files={"references/policy.md": "Refunds are available within 30 days."},
+)
+
+mcp = FastMCP("Support")
+mcp.add_provider(SkillProvider(skill))
+mcp.add_extension(SkillsExtension())
 ```
 
-Use `SkillProvider` when you want to expose exactly one skill, or when you need fine-grained control over individual skill configuration.
+`Skill.from_directory(path)` constructs the same immutable object from a directory containing `SKILL.md`. The directory name must match the skill's frontmatter `name`. Additional files retain their relative paths and exact bytes.
 
-### SkillsDirectoryProvider
+`SkillProvider` also accepts `path="billing/refunds"` or a full `uri="catalog://billing/refunds/SKILL.md"`. The directory immediately before `SKILL.md` must match the skill's `name`.
 
-`SkillsDirectoryProvider` scans one or more root directories and creates a `SkillProvider` for each valid skill folder it finds. A folder is considered a valid skill if it contains the main file (default: `SKILL.md`).
+For application-owned storage, pass a mapping of relative paths to `Skill.from_files()`, or load packaged assets with `Skill.from_package(package, path)`. These constructors return the same snapshot type, so providers do not need to know whether the source was Python code, a database, a package, or a directory.
+
+Use `SkillCatalogProvider` when the catalog itself belongs to an application service. Its async callbacks return `SkillPublication` values; an optional direct lookup callback avoids listing the full catalog for `skills/get` and resource reads.
+
+FastMCP includes a static skill in `skills/list` or `skills/get` only when every file in its manifest is readable to that client. This keeps the manifest aligned with resource authorization and transforms. A direct catalog lookup can serve a skill through `skills/get` and directory reads even when that skill is absent from the catalog listing.
+
+```python
+from fastmcp import FastMCP, Skill
+from fastmcp.server.providers.skills import (
+    SkillCatalogProvider,
+    SkillPublication,
+)
+from fastmcp.server.skills import SkillsExtension
+
+async def list_from_database() -> list[SkillPublication]:
+    record = {
+        "SKILL.md": """---
+name: refunds
+description: Refund support.
+---
+Check the current billing policy.""",
+        "references/policy.md": "Refund policy from the application catalog.",
+    }
+    skill = Skill.from_files(record)
+    return [SkillPublication(skill=skill, path="billing/refunds")]
+
+mcp = FastMCP("Billing")
+mcp.add_provider(SkillCatalogProvider(list_from_database))
+mcp.add_extension(SkillsExtension())
+mcp.run()
+```
+
+```python
+from pathlib import Path
+
+from fastmcp import FastMCP, Skill
+from fastmcp.server.providers.skills import SkillProvider
+from fastmcp.server.skills import SkillsExtension
+
+skill = Skill.from_directory(Path("skills/refunds"))
+mcp = FastMCP("Support")
+mcp.add_provider(SkillProvider(skill))
+mcp.add_extension(SkillsExtension())
+```
+
+## Load a directory of skills
+
+Use `SkillsDirectoryProvider` to publish every skill below one or more roots. It takes an initial snapshot when constructed. Call `await provider.reload()` to atomically replace that snapshot after files change. `reload=True` enables automatic rescanning for development.
 
 ```python
 from pathlib import Path
 
 from fastmcp import FastMCP
 from fastmcp.server.providers.skills import SkillsDirectoryProvider
+from fastmcp.server.skills import SkillsExtension
 
-mcp = FastMCP("Skills")
-mcp.add_provider(SkillsDirectoryProvider(roots=Path.home() / ".claude" / "skills"))
+provider = SkillsDirectoryProvider(Path("skills"))
+mcp = FastMCP("Support")
+mcp.add_provider(provider)
+mcp.add_extension(SkillsExtension())
+
+# After updating the directory:
+# await provider.reload()
 ```
 
-When scanning multiple root directories, provide them as a list. The first directory takes precedence if the same skill name appears in multiple roots.
+Each skill must live in a directory whose final path segment matches its frontmatter name. Nested directories are allowed. Symlinks, unsafe relative paths, invalid frontmatter, duplicate publication paths, and bundles over the protocol size limits are rejected when a snapshot is built.
+
+## Retrieve skills from a client
+
+FastMCP clients check the server's advertised extension capability, paginate `skills/list`, fetch a skill by URI, and verify downloaded bytes against the manifest's SHA-256 digest and size.
+
+Use `iter_skills()` to process large catalogs a page at a time, or `list_skills()` when the complete catalog fits in memory.
+
+For a terminal overview, run `fastmcp list <server> --skills` or add `--json` for machine-readable output.
 
 ```python
-from pathlib import Path
-
-from fastmcp import FastMCP
-from fastmcp.server.providers.skills import SkillsDirectoryProvider
-
-mcp = FastMCP("Skills")
-mcp.add_provider(SkillsDirectoryProvider(roots=[
-    Path.cwd() / ".claude" / "skills",      # Project-level skills first
-    Path.home() / ".claude" / "skills",     # User-level fallback
-]))
-```
-
-## Vendor Providers
-
-FastMCP includes pre-configured providers for popular AI coding tools. Each vendor provider extends `SkillsDirectoryProvider` with the appropriate default directory for that platform.
-
-| Provider | Default Directory |
-|----------|-------------------|
-| `ClaudeSkillsProvider` | `~/.claude/skills/` |
-| `CursorSkillsProvider` | `~/.cursor/skills/` |
-| `VSCodeSkillsProvider` | `~/.copilot/skills/` |
-| `CodexSkillsProvider` | `/etc/codex/skills/` and `~/.codex/skills/` |
-| `GeminiSkillsProvider` | `~/.gemini/skills/` |
-| `GooseSkillsProvider` | `~/.config/agents/skills/` |
-| `CopilotSkillsProvider` | `~/.copilot/skills/` |
-| `OpenCodeSkillsProvider` | `~/.config/opencode/skills/` |
-
-Vendor providers accept the same configuration options as `SkillsDirectoryProvider` (except for `roots`, which is locked to the platform default).
-
-```python
-from fastmcp import FastMCP
-from fastmcp.server.providers.skills import ClaudeSkillsProvider
-
-mcp = FastMCP("Claude Skills")
-mcp.add_provider(ClaudeSkillsProvider())  # Uses ~/.claude/skills/
-```
-
-`CodexSkillsProvider` scans both system-level (`/etc/codex/skills/`) and user-level (`~/.codex/skills/`) directories, with system skills taking precedence.
-
-## Supporting Files Disclosure
-
-The `supporting_files` parameter controls how supporting files (everything except the main file and manifest) appear to clients.
-
-### Template Mode (Default)
-
-With `supporting_files="template"`, supporting files are accessed through a `ResourceTemplate` rather than being listed as individual resources. Clients see only the main file and manifest in `list_resources()`, then discover supporting files by reading the manifest.
-
-```python
-from pathlib import Path
-
-from fastmcp.server.providers.skills import SkillsDirectoryProvider
-
-# Default behavior - supporting files hidden from list_resources()
-provider = SkillsDirectoryProvider(
-    roots=Path.home() / ".claude" / "skills",
-    supporting_files="template",  # This is the default
-)
-```
-
-This keeps the resource list compact when skills contain many files. Clients that need supporting files read the manifest first, then request specific files by URI.
-
-### Resources Mode
-
-With `supporting_files="resources"`, every file in every skill appears as an individual resource in `list_resources()`. Clients get full enumeration upfront without needing to read manifests.
-
-```python
-from pathlib import Path
-
-from fastmcp.server.providers.skills import SkillsDirectoryProvider
-
-# All files visible as individual resources
-provider = SkillsDirectoryProvider(
-    roots=Path.home() / ".claude" / "skills",
-    supporting_files="resources",
-)
-```
-
-Use this mode when clients need to discover all available files without additional round trips, or when integrating with tools that expect flat resource lists.
-
-## Reload Mode
-
-Enable reload mode to re-scan the skills directory on every request. Changes to skills take effect immediately without restarting the server.
-
-```python
-from pathlib import Path
-
-from fastmcp.server.providers.skills import SkillsDirectoryProvider
-
-provider = SkillsDirectoryProvider(
-    roots=Path.home() / ".claude" / "skills",
-    reload=True,
-)
-```
-
-With `reload=True`, the provider re-discovers skills on each `list_resources()` or `read_resource()` call. New skills appear, removed skills disappear, and modified content reflects current file state.
-
-<Warning>
-Reload mode adds overhead to every request. Use it during development when you're actively editing skills, but disable it in production.
-</Warning>
-
-## Client Utilities
-
-FastMCP provides utilities for downloading skills from any MCP server that exposes them. These are standalone functions in `fastmcp.utilities.skills`.
-
-### Discovering Skills
-
-Use `list_skills()` to see what skills are available on a server.
-
-```python
-from fastmcp import Client
-from fastmcp.utilities.skills import list_skills
-
-async with Client("http://skills-server/mcp") as client:
-    skills = await list_skills(client)
-    for skill in skills:
-        print(f"{skill.name}: {skill.description}")
-```
-
-### Downloading Skills
-
-Use `download_skill()` to download a single skill, or `sync_skills()` to download all available skills.
-
-```python
-from pathlib import Path
+import asyncio
 
 from fastmcp import Client
-from fastmcp.utilities.skills import download_skill, sync_skills
 
-async with Client("http://skills-server/mcp") as client:
-    # Download one skill
-    path = await download_skill(client, "pdf-processing", Path.home() / ".claude" / "skills")
+async def main() -> None:
+    async with Client("http://localhost:8000/mcp") as client:
+        for skill in await client.list_skills():
+            print(skill.name, skill.description, skill.origin)
+            instructions = await skill.read()
+            print(instructions.text)
+            policy = await skill.read("references/policy.md")
+            print(policy.text)
 
-    # Or download all skills
-    paths = await sync_skills(client, Path.home() / ".claude" / "skills")
+asyncio.run(main())
 ```
 
-Both functions accept an `overwrite` parameter. When `False` (default), existing skills are skipped. When `True`, existing files are replaced.
+`RemoteSkill.read()` returns verified bytes, MIME type, resource URI, skill URI, and origin. It rejects files absent from the manifest and content whose size or digest has changed. A skill that declares dynamic resources must be read with `allow_unverified=True`; dynamic content cannot be checked against a static manifest.
 
-### Inspecting Manifests
+The optional `resources/directory/read` method supports directory browsing. The server advertises it as `directoryRead: true`, and `client.read_resource_directory(uri)` follows its pagination. Clients can also call `list_skills_mcp()` and `get_skill_mcp(uri)` when they need the raw protocol result or manual pagination.
 
-Use `get_skill_manifest()` to see what files a skill contains before downloading.
+When proxying a server that does not support directory reads, FastMCP derives a static skill's tree from its manifest. For a dynamic skill, it uses the upstream resources currently visible in `resources/list`. Empty directories and dynamic files absent from those sources cannot be reconstructed.
 
-```python
-from fastmcp import Client
-from fastmcp.utilities.skills import get_skill_manifest
+## Trust and activation
 
-async with Client("http://skills-server/mcp") as client:
-    manifest = await get_skill_manifest(client, "pdf-processing")
-    for file in manifest.files:
-        print(f"{file.path} ({file.size} bytes, {file.hash})")
-```
+The extension transports skill content. It does not activate instructions, grant tools, or decide whether a host should trust a skill. Hosts must apply their own review, permission, and execution policies to received content.
+
+The manifest describes the exact bytes the server publishes. Clients should keep the skill's origin attached when caching or presenting content, and should treat the content as untrusted input even after integrity verification: the digest proves consistency with the server's manifest, not that the instructions are safe.

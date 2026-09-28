@@ -1003,6 +1003,7 @@ client = [
     { name = "mcp" },
     { name = "opentelemetry-api" },
     { name = "py-key-value-aio", extra = ["filetree", "keyring", "memory"] },
+    { name = "pyyaml" },
     { name = "starlette" },
 ]
 code-mode = [
@@ -1089,6 +1090,7 @@ requires-dist = [
     { name = "pyperclip", marker = "extra == 'server'", specifier = ">=1.9.0" },
     { name = "python-dotenv", specifier = ">=1.1.0" },
     { name = "python-multipart", marker = "extra == 'server'", specifier = ">=0.0.26" },
+    { name = "pyyaml", marker = "extra == 'client'", specifier = ">=6.0,<7.0" },
     { name = "pyyaml", marker = "extra == 'server'", specifier = ">=6.0,<7.0" },
     { name = "rich", specifier = ">=13.9.4" },
     { name = "starlette", marker = "extra == 'client'", specifier = ">=1.0.1" },

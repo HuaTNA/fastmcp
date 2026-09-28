@@ -13,6 +13,7 @@ from rich.console import Console
 from rich.markup import escape as escape_rich_markup
 
 from fastmcp.cli.discovery import DiscoveredServer, discover_servers, resolve_name
+from fastmcp.cli.skills import print_skills, skills_to_json
 from fastmcp.client.client import CallToolResult, Client
 from fastmcp.client.elicitation import ElicitResult
 from fastmcp.client.transports.base import ClientTransport
@@ -664,6 +665,10 @@ async def list_command(
         bool,
         cyclopts.Parameter("--resources", help="Also list resources"),
     ] = False,
+    skills: Annotated[
+        bool,
+        cyclopts.Parameter("--skills", help="Also list MCP Skills"),
+    ] = False,
     prompts: Annotated[
         bool,
         cyclopts.Parameter("--prompts", help="Also list prompts"),
@@ -708,9 +713,12 @@ async def list_command(
     try:
         async with client:
             tools = await client.list_tools()
+            listed_skills = await client.list_skills() if skills else None
 
             if json_output:
                 data: dict[str, Any] = {"tools": _tools_to_json(tools)}
+                if listed_skills is not None:
+                    data["skills"] = skills_to_json(listed_skills)
                 if resources:
                     res = await client.list_resources()
                     data["resources"] = [
@@ -753,6 +761,9 @@ async def list_command(
                     if output_schema and tool.output_schema:
                         _print_schema("Output", tool.output_schema)
                     console.print()
+
+            if listed_skills is not None:
+                print_skills(listed_skills)
 
             if resources:
                 res = await client.list_resources()

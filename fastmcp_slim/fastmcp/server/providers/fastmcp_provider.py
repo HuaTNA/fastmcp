@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
-from pydantic import AnyUrl
+from pydantic import AnyUrl, PrivateAttr
 
 from fastmcp.prompts.base import Prompt, PromptResult
 from fastmcp.resources.base import Resource, ResourceResult
@@ -127,6 +127,7 @@ class FastMCPProviderResource(Resource):
 
     _server: Any = None  # FastMCP, but Any to avoid circular import
     _original_uri: str | None = None
+    _original_resource: Resource | None = PrivateAttr(default=None)
 
     def __init__(
         self,
@@ -141,7 +142,7 @@ class FastMCPProviderResource(Resource):
     @classmethod
     def wrap(cls, server: Any, resource: Resource) -> FastMCPProviderResource:
         """Wrap a Resource to delegate reading to the server's middleware."""
-        return cls(
+        wrapped = cls(
             server=server,
             original_uri=str(resource.uri),
             uri=resource.uri,
@@ -156,6 +157,8 @@ class FastMCPProviderResource(Resource):
             title=resource.title,
             icons=resource.icons,
         )
+        wrapped._original_resource = resource
+        return wrapped
 
     async def _read(self) -> ResourceResult:
         """Delegate to the child server's read_resource().

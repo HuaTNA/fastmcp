@@ -1,1065 +1,646 @@
-"""Tests for SkillProvider, SkillsDirectoryProvider, and ClaudeSkillsProvider."""
+from __future__ import annotations
 
-import json
-from pathlib import Path
+import importlib
+from typing import cast
 
 import pytest
-from mcp_types import TextResourceContents
-from pydantic import AnyUrl
+from mcp.shared.exceptions import MCPError
 
-from fastmcp import Client, FastMCP
+from fastmcp import Client, Skill
+from fastmcp.resources.base import Resource
+from fastmcp.resources.types import TextResource
+from fastmcp.server.providers.proxy import ProxyProvider
 from fastmcp.server.providers.skills import (
-    ClaudeSkillsProvider,
+    SkillCatalogProvider,
     SkillProvider,
+    SkillPublication,
     SkillsDirectoryProvider,
 )
-from fastmcp.server.providers.skills._common import parse_frontmatter
-from fastmcp.server.providers.skills.skill_provider import SkillFileResource
+from fastmcp.server.server import FastMCP
+from fastmcp.server.skills import SkillsExtension
+from fastmcp.server.transforms import Transform
 
 
-class TestParseFrontmatter:
-    def test_no_frontmatter(self):
-        content = "# Just markdown\n\nSome content."
-        frontmatter, body = parse_frontmatter(content)
-        assert frontmatter == {}
-        assert body == content
-
-    def test_basic_frontmatter(self):
-        content = """---
-description: A test skill
-version: "1.0.0"
----
-
-# Skill Content
-"""
-        frontmatter, body = parse_frontmatter(content)
-        assert frontmatter["description"] == "A test skill"
-        assert frontmatter["version"] == "1.0.0"
-        assert body.strip().startswith("# Skill Content")
-
-    def test_frontmatter_with_tags_list(self):
-        content = """---
-description: Test
-tags: [tag1, tag2, tag3]
----
-
-Content
-"""
-        frontmatter, body = parse_frontmatter(content)
-        assert frontmatter["tags"] == ["tag1", "tag2", "tag3"]
-
-    def test_frontmatter_with_quoted_strings(self):
-        content = """---
-description: "A skill with quotes"
-version: '2.0.0'
----
-
-Content
-"""
-        frontmatter, body = parse_frontmatter(content)
-        assert frontmatter["description"] == "A skill with quotes"
-        assert frontmatter["version"] == "2.0.0"
-
-    def test_frontmatter_multiline_literal_block(self):
-        content = """---
-description: |
-  This is a multiline
-  description for the skill
----
-
-# Skill Content
-"""
-        frontmatter, body = parse_frontmatter(content)
-        assert frontmatter["description"] == (
-            "This is a multiline\ndescription for the skill"
-        )
-        assert body.strip().startswith("# Skill Content")
-
-    def test_frontmatter_multiline_folded_block(self):
-        content = """---
-description: >
-  This is a folded
-  multiline description
----
-
-# Skill Content
-"""
-        frontmatter, body = parse_frontmatter(content)
-        assert frontmatter["description"] == "This is a folded multiline description"
-        assert body.strip().startswith("# Skill Content")
-
-    def test_frontmatter_malformed_falls_back_to_line_parser(self):
-        # Invalid YAML list — safe_load fails; line parser keeps plain keys.
-        content = """---
-description: [unclosed
-name: still-parsed
----
-
-Body
-"""
-        frontmatter, body = parse_frontmatter(content)
-        assert frontmatter["name"] == "still-parsed"
-        assert frontmatter["description"] == "[unclosed"
-        assert body == "Body\n"
-
-    def test_frontmatter_colon_in_value_falls_back_preserves_keys(self):
-        # Real skill files sometimes contain unquoted values with ": " that
-        # PyYAML rejects; must not drop description (FastMCP #4416 review).
-        content = """---
-name: oss-daily
-description: Use when Vishnu wants: daily OSS drafting
----
-
-# Body
-"""
-        frontmatter, body = parse_frontmatter(content)
-        assert frontmatter["name"] == "oss-daily"
-        assert "daily OSS drafting" in frontmatter["description"]
-        assert body.strip().startswith("# Body")
-
-    def test_frontmatter_non_dict_returns_empty(self):
-        content = """---
-- item1
-- item2
----
-
-Body
-"""
-        frontmatter, body = parse_frontmatter(content)
-        assert frontmatter == {}
-        assert body == "Body\n"
-
-    def test_frontmatter_scalars_are_preserved_as_strings(self):
-        """`SkillInfo.frontmatter` is public; it must not silently retype values.
-
-        `yaml.BaseLoader` parses block scalars (unlike the old line parser)
-        but applies no implicit scalar resolution, so every value comes back
-        exactly as written instead of being coerced to float/bool/date the
-        way a full loader (e.g. `safe_load`) would.
-
-        The `description: null` case looks surprising but is intentional:
-        under `BaseLoader`, YAML's null token resolves to the *string*
-        `"null"`, not Python `None`. This matches the pre-existing line-based
-        parser (which did `value.strip()` on the raw text and also produced
-        `"null"`), so this restores original behavior rather than inventing
-        a new one. Do not "fix" this back to `None`.
-        """
-        content = """---
-version: 1.10
-enabled: yes
-released: 2024-01-01
-description: null
----
-
-Body
-"""
-        frontmatter, body = parse_frontmatter(content)
-        assert frontmatter["version"] == "1.10"
-        assert frontmatter["enabled"] == "yes"
-        assert frontmatter["released"] == "2024-01-01"
-        assert frontmatter["description"] == "null"
-        for value in frontmatter.values():
-            assert isinstance(value, str)
-
-    def test_frontmatter_description_bool_recovers_original_text(self):
-        content = """---
-description: true
----
-
-Body
-"""
-        frontmatter, body = parse_frontmatter(content)
-        assert frontmatter["description"] == "true"
-        assert isinstance(frontmatter["description"], str)
-
-    def test_frontmatter_description_yes_not_coerced_to_true(self):
-        # FastMCP #4416 regression: `yes` bare word previously coerced to True.
-        content = """---
-description: yes
----
-
-Body
-"""
-        frontmatter, body = parse_frontmatter(content)
-        assert frontmatter["description"] == "yes"
-
-    def test_frontmatter_description_no_not_coerced_to_false(self):
-        content = """---
-description: no
----
-
-Body
-"""
-        frontmatter, body = parse_frontmatter(content)
-        assert frontmatter["description"] == "no"
-
-    def test_frontmatter_description_numeric_scalar_preserves_original_text(self):
-        # YAML resolves `1.10` to float 1.1, dropping the trailing zero the author wrote.
-        content = """---
-description: 1.10
----
-
-Body
-"""
-        frontmatter, body = parse_frontmatter(content)
-        assert frontmatter["description"] == "1.10"
-
-
-class TestSkillProvider:
-    """Tests for SkillProvider - single skill folder."""
-
-    @pytest.fixture
-    def single_skill_dir(self, tmp_path: Path) -> Path:
-        """Create a single skill directory with files."""
-        skill_dir = tmp_path / "my-skill"
-        skill_dir.mkdir()
-        (skill_dir / "SKILL.md").write_text(
-            """---
-description: A test skill
-version: "1.0.0"
----
-
-# My Skill
-
-This is my skill content.
-"""
-        )
-        (skill_dir / "reference.md").write_text("# Reference\n\nExtra docs.")
-        (skill_dir / "scripts").mkdir()
-        (skill_dir / "scripts" / "helper.py").write_text('print("helper")')
-        return skill_dir
-
-    def test_loads_skill_at_init(self, single_skill_dir: Path):
-        provider = SkillProvider(skill_path=single_skill_dir)
-        assert provider.skill_info.name == "my-skill"
-        assert provider.skill_info.description == "A test skill"
-        assert len(provider.skill_info.files) == 3
-
-    def test_loads_frontmatter_from_utf8_bom_skill(self, tmp_path: Path):
-        skill_dir = tmp_path / "bom-skill"
-        skill_dir.mkdir()
-        (skill_dir / "SKILL.md").write_text(
-            "\ufeff---\n"
-            "name: bom-skill\n"
-            "description: Skill saved with a UTF-8 BOM\n"
-            "---\n"
-            "# BOM Skill\n",
-            encoding="utf-8",
-        )
-
-        provider = SkillProvider(skill_path=skill_dir)
-
-        assert provider.skill_info.description == "Skill saved with a UTF-8 BOM"
-        assert provider.skill_info.frontmatter == {
-            "name": "bom-skill",
-            "description": "Skill saved with a UTF-8 BOM",
-        }
-
-    def test_raises_if_directory_missing(self, tmp_path: Path):
-        with pytest.raises(FileNotFoundError, match="Skill directory not found"):
-            SkillProvider(skill_path=tmp_path / "nonexistent")
-
-    def test_raises_if_main_file_missing(self, tmp_path: Path):
-        skill_dir = tmp_path / "no-main"
-        skill_dir.mkdir()
-        with pytest.raises(FileNotFoundError, match="Main skill file not found"):
-            SkillProvider(skill_path=skill_dir)
-
-    async def test_list_resources_default_template_mode(self, single_skill_dir: Path):
-        """In template mode (default), only main file and manifest are resources."""
-        provider = SkillProvider(skill_path=single_skill_dir)
-        resources = await provider.list_resources()
-
-        assert len(resources) == 2
-        names = {r.name for r in resources}
-        assert "my-skill/SKILL.md" in names
-        assert "my-skill/_manifest" in names
-
-    async def test_list_resources_supporting_files_as_resources(
-        self, single_skill_dir: Path
-    ):
-        """In resources mode, supporting files are also exposed as resources."""
-        provider = SkillProvider(
-            skill_path=single_skill_dir, supporting_files="resources"
-        )
-        resources = await provider.list_resources()
-
-        # 2 standard + 2 supporting files
-        assert len(resources) == 4
-        names = {r.name for r in resources}
-        assert "my-skill/SKILL.md" in names
-        assert "my-skill/_manifest" in names
-        assert "my-skill/reference.md" in names
-        assert "my-skill/scripts/helper.py" in names
-
-    async def test_list_templates_default_mode(self, single_skill_dir: Path):
-        """In template mode (default), one template is exposed."""
-        provider = SkillProvider(skill_path=single_skill_dir)
-        templates = await provider.list_resource_templates()
-
-        assert len(templates) == 1
-        assert templates[0].name == "my-skill_files"
-
-    async def test_list_templates_resources_mode(self, single_skill_dir: Path):
-        """In resources mode, no templates are exposed."""
-        provider = SkillProvider(
-            skill_path=single_skill_dir, supporting_files="resources"
-        )
-        templates = await provider.list_resource_templates()
-
-        assert templates == []
-
-    async def test_read_main_file(self, single_skill_dir: Path):
-        mcp = FastMCP("Test")
-        mcp.add_provider(SkillProvider(skill_path=single_skill_dir))
-
-        async with Client(mcp) as client:
-            result = await client.read_resource(AnyUrl("skill://my-skill/SKILL.md"))
-            assert len(result) == 1
-            assert isinstance(result[0], TextResourceContents)
-            assert "# My Skill" in result[0].text
-
-    async def test_read_main_file_with_literal_percent_in_name(self, tmp_path: Path):
-        """A custom main_file_name containing a literal '%' must round-trip
-        through the same encode/decode path as supporting files (#4545)."""
-        skill_dir = tmp_path / "percent-main-skill"
-        skill_dir.mkdir()
-        (skill_dir / "MAIN%20FILE.md").write_text("# Demo\n")
-
-        mcp = FastMCP("Test")
-        mcp.add_provider(
-            SkillProvider(skill_path=skill_dir, main_file_name="MAIN%20FILE.md")
-        )
-
-        async with Client(mcp) as client:
-            resources = await client.list_resources()
-            main = next(
-                r for r in resources if r.name == "percent-main-skill/MAIN%20FILE.md"
-            )
-            result = await client.read_resource(main.uri)
-            assert "# Demo" in result[0].text
-
-    async def test_read_manifest(self, single_skill_dir: Path):
-        mcp = FastMCP("Test")
-        mcp.add_provider(SkillProvider(skill_path=single_skill_dir))
-
-        async with Client(mcp) as client:
-            result = await client.read_resource(AnyUrl("skill://my-skill/_manifest"))
-            manifest = json.loads(result[0].text)
-            assert manifest["skill"] == "my-skill"
-            assert len(manifest["files"]) == 3
-            paths = {f["path"] for f in manifest["files"]}
-            assert "SKILL.md" in paths
-            assert "reference.md" in paths
-            assert "scripts/helper.py" in paths
-
-    async def test_manifest_ignores_symlink_target_outside_skill(self, tmp_path: Path):
-        skill_dir = tmp_path / "symlinked-skill"
-        skill_dir.mkdir()
-        (skill_dir / "SKILL.md").write_text("# Skill\n")
-
-        outside_file = tmp_path / "outside.txt"
-        outside_file.write_text("secret")
-        (skill_dir / "leak.txt").symlink_to(outside_file)
-
-        mcp = FastMCP("Test")
-        mcp.add_provider(SkillProvider(skill_path=skill_dir))
-
-        async with Client(mcp) as client:
-            result = await client.read_resource(
-                AnyUrl("skill://symlinked-skill/_manifest")
-            )
-            manifest = json.loads(result[0].text)
-
-        paths = {f["path"] for f in manifest["files"]}
-        assert "SKILL.md" in paths
-        assert "leak.txt" not in paths
-
-    async def test_read_supporting_file_via_template(self, single_skill_dir: Path):
-        mcp = FastMCP("Test")
-        mcp.add_provider(SkillProvider(skill_path=single_skill_dir))
-
-        async with Client(mcp) as client:
-            result = await client.read_resource(AnyUrl("skill://my-skill/reference.md"))
-            assert "# Reference" in result[0].text
-
-    async def test_read_supporting_file_via_resource_mode(self, single_skill_dir: Path):
-        mcp = FastMCP("Test")
-        mcp.add_provider(
-            SkillProvider(skill_path=single_skill_dir, supporting_files="resources")
-        )
-
-        async with Client(mcp) as client:
-            result = await client.read_resource(AnyUrl("skill://my-skill/reference.md"))
-            assert "# Reference" in result[0].text
-
-    async def test_read_supporting_file_with_space_in_name(self, tmp_path: Path):
-        """Percent-encoded resource URIs for supporting files must round-trip (#4545)."""
-        skill_dir = tmp_path / "space-skill"
-        skill_dir.mkdir()
-        (skill_dir / "SKILL.md").write_text("# Skill\n")
-        (skill_dir / "setup guide.md").write_text("SPACE OK")
-
-        mcp = FastMCP("Test")
-        mcp.add_provider(
-            SkillProvider(skill_path=skill_dir, supporting_files="resources")
-        )
-
-        async with Client(mcp) as client:
-            resources = await client.list_resources()
-            supporting = next(
-                r for r in resources if r.name == "space-skill/setup guide.md"
-            )
-            assert str(supporting.uri) == "skill://space-skill/setup%20guide.md"
-
-            result = await client.read_resource(supporting.uri)
-            assert result[0].text == "SPACE OK"
-
-    async def test_read_supporting_file_with_utf8_name(self, tmp_path: Path):
-        skill_dir = tmp_path / "utf8-skill"
-        skill_dir.mkdir()
-        (skill_dir / "SKILL.md").write_text("# Skill\n")
-        (skill_dir / "café.md").write_text("UTF8 OK", encoding="utf-8")
-
-        mcp = FastMCP("Test")
-        mcp.add_provider(
-            SkillProvider(skill_path=skill_dir, supporting_files="resources")
-        )
-
-        async with Client(mcp) as client:
-            resources = await client.list_resources()
-            supporting = next(r for r in resources if r.name == "utf8-skill/café.md")
-
-            result = await client.read_resource(supporting.uri)
-            assert result[0].text == "UTF8 OK"
-
-    async def test_percent_encoded_name_does_not_collide_with_space(
-        self, tmp_path: Path
-    ):
-        """A filename that already contains a literal '%20' must not be confused
-        with a space-containing filename once both are percent-encoded into
-        resource URIs (#4545)."""
-        skill_dir = tmp_path / "percent-skill"
-        skill_dir.mkdir()
-        (skill_dir / "SKILL.md").write_text("# Skill\n")
-        (skill_dir / "setup guide.md").write_text("SPACE OK")
-        (skill_dir / "setup%20guide.md").write_text("LITERAL PERCENT OK")
-
-        mcp = FastMCP("Test")
-        mcp.add_provider(
-            SkillProvider(skill_path=skill_dir, supporting_files="resources")
-        )
-
-        async with Client(mcp) as client:
-            resources = await client.list_resources()
-            by_name = {r.name: r for r in resources}
-            space_uri = by_name["percent-skill/setup guide.md"].uri
-            literal_uri = by_name["percent-skill/setup%20guide.md"].uri
-
-            assert str(space_uri) != str(literal_uri)
-
-            space_result = await client.read_resource(space_uri)
-            literal_result = await client.read_resource(literal_uri)
-            assert space_result[0].text == "SPACE OK"
-            assert literal_result[0].text == "LITERAL PERCENT OK"
-
-    async def test_skill_resource_meta(self, single_skill_dir: Path):
-        """SkillResource populates meta with skill name and is_manifest."""
-        provider = SkillProvider(skill_path=single_skill_dir)
-        resources = await provider.list_resources()
-
-        by_name = {r.name: r for r in resources}
-
-        main_meta = by_name["my-skill/SKILL.md"].get_meta()
-        assert main_meta["fastmcp"]["skill"] == {
-            "name": "my-skill",
-            "is_manifest": False,
-        }
-
-        manifest_meta = by_name["my-skill/_manifest"].get_meta()
-        assert manifest_meta["fastmcp"]["skill"] == {
-            "name": "my-skill",
-            "is_manifest": True,
-        }
-
-    async def test_skill_file_resource_meta(self, single_skill_dir: Path):
-        """SkillFileResource populates meta with skill name."""
-        provider = SkillProvider(
-            skill_path=single_skill_dir, supporting_files="resources"
-        )
-        resources = await provider.list_resources()
-
-        by_name = {r.name: r for r in resources}
-        file_meta = by_name["my-skill/reference.md"].get_meta()
-        assert file_meta["fastmcp"]["skill"] == {"name": "my-skill"}
-
-    async def test_skill_meta_survives_mounting(self, single_skill_dir: Path):
-        """Skill metadata in _meta is preserved when accessed through a mounted server."""
-        child = FastMCP("child")
-        child.add_provider(SkillProvider(skill_path=single_skill_dir))
-
-        parent = FastMCP("parent")
-        parent.mount(child, "skills")
-
-        resources = await parent.list_resources()
-        by_name = {r.name: r for r in resources}
-
-        main_meta = by_name["my-skill/SKILL.md"].get_meta()
-        assert main_meta["fastmcp"]["skill"] == {
-            "name": "my-skill",
-            "is_manifest": False,
-        }
-
-        manifest_meta = by_name["my-skill/_manifest"].get_meta()
-        assert manifest_meta["fastmcp"]["skill"] == {
-            "name": "my-skill",
-            "is_manifest": True,
-        }
-
-
-class TestSkillsDirectoryProvider:
-    """Tests for SkillsDirectoryProvider - scans directory for skill folders."""
-
-    @pytest.fixture
-    def skills_dir(self, tmp_path: Path) -> Path:
-        """Create a test skills directory with sample skills."""
-        skills_root = tmp_path / "skills"
-        skills_root.mkdir()
-
-        # Create a simple skill
-        simple_skill = skills_root / "simple-skill"
-        simple_skill.mkdir()
-        (simple_skill / "SKILL.md").write_text(
-            """---
-description: A simple test skill
-version: "1.0.0"
----
-
-# Simple Skill
-
-This is a simple skill for testing.
-"""
-        )
-
-        # Create a skill with supporting files
-        complex_skill = skills_root / "complex-skill"
-        complex_skill.mkdir()
-        (complex_skill / "SKILL.md").write_text(
-            """---
-description: A complex skill with supporting files
----
-
-# Complex Skill
-
-See [reference](reference.md) for more details.
-"""
-        )
-        (complex_skill / "reference.md").write_text(
-            """# Reference
-
-Additional documentation.
-"""
-        )
-        (complex_skill / "scripts").mkdir()
-        (complex_skill / "scripts" / "helper.py").write_text(
-            'print("Hello from helper")'
-        )
-
-        return skills_root
-
-    async def test_list_resources_discovers_skills(self, skills_dir: Path):
-        provider = SkillsDirectoryProvider(roots=skills_dir)
-        resources = await provider.list_resources()
-
-        # Should have 2 resources per skill (main file + manifest)
-        assert len(resources) == 4
-
-        # Check resource names
-        resource_names = {r.name for r in resources}
-        assert "simple-skill/SKILL.md" in resource_names
-        assert "simple-skill/_manifest" in resource_names
-        assert "complex-skill/SKILL.md" in resource_names
-        assert "complex-skill/_manifest" in resource_names
-
-    async def test_list_resources_includes_descriptions(self, skills_dir: Path):
-        provider = SkillsDirectoryProvider(roots=skills_dir)
-        resources = await provider.list_resources()
-
-        # Find the simple-skill main resource
-        simple_skill = next(r for r in resources if r.name == "simple-skill/SKILL.md")
-        assert simple_skill.description == "A simple test skill"
-
-    async def test_read_main_skill_file(self, skills_dir: Path):
-        mcp = FastMCP("Test")
-        mcp.add_provider(SkillsDirectoryProvider(roots=skills_dir))
-
-        async with Client(mcp) as client:
-            result = await client.read_resource(AnyUrl("skill://simple-skill/SKILL.md"))
-            assert len(result) == 1
-            assert isinstance(result[0], TextResourceContents)
-            assert "# Simple Skill" in result[0].text
-
-    async def test_read_manifest(self, skills_dir: Path):
-        mcp = FastMCP("Test")
-        mcp.add_provider(SkillsDirectoryProvider(roots=skills_dir))
-
-        async with Client(mcp) as client:
-            result = await client.read_resource(
-                AnyUrl("skill://complex-skill/_manifest")
-            )
-            assert len(result) == 1
-            assert isinstance(result[0], TextResourceContents)
-
-            manifest = json.loads(result[0].text)
-            assert manifest["skill"] == "complex-skill"
-            assert len(manifest["files"]) == 3  # SKILL.md, reference.md, helper.py
-
-            # Check file paths
-            paths = {f["path"] for f in manifest["files"]}
-            assert "SKILL.md" in paths
-            assert "reference.md" in paths
-            assert "scripts/helper.py" in paths
-
-            # Check hashes are present
-            for file_info in manifest["files"]:
-                assert file_info["hash"].startswith("sha256:")
-                assert file_info["size"] > 0
-
-    async def test_list_resource_templates(self, skills_dir: Path):
-        provider = SkillsDirectoryProvider(roots=skills_dir)
-        templates = await provider.list_resource_templates()
-
-        # One template per skill
-        assert len(templates) == 2
-
-        template_names = {t.name for t in templates}
-        assert "simple-skill_files" in template_names
-        assert "complex-skill_files" in template_names
-
-    async def test_read_supporting_file_via_template(self, skills_dir: Path):
-        mcp = FastMCP("Test")
-        mcp.add_provider(SkillsDirectoryProvider(roots=skills_dir))
-
-        async with Client(mcp) as client:
-            result = await client.read_resource(
-                AnyUrl("skill://complex-skill/reference.md")
-            )
-            assert len(result) == 1
-            assert isinstance(result[0], TextResourceContents)
-            assert "# Reference" in result[0].text
-
-    async def test_read_nested_file_via_template(self, skills_dir: Path):
-        mcp = FastMCP("Test")
-        mcp.add_provider(SkillsDirectoryProvider(roots=skills_dir))
-
-        async with Client(mcp) as client:
-            result = await client.read_resource(
-                AnyUrl("skill://complex-skill/scripts/helper.py")
-            )
-            assert len(result) == 1
-            assert isinstance(result[0], TextResourceContents)
-            assert "Hello from helper" in result[0].text
-
-    async def test_empty_skills_directory(self, tmp_path: Path):
-        empty_dir = tmp_path / "empty"
-        empty_dir.mkdir()
-
-        provider = SkillsDirectoryProvider(roots=empty_dir)
-        resources = await provider.list_resources()
-        assert resources == []
-
-        templates = await provider.list_resource_templates()
-        assert templates == []
-
-    async def test_nonexistent_skills_directory(self, tmp_path: Path):
-        nonexistent = tmp_path / "does-not-exist"
-        provider = SkillsDirectoryProvider(roots=nonexistent)
-
-        resources = await provider.list_resources()
-        assert resources == []
-
-    async def test_reload_mode(self, skills_dir: Path):
-        provider = SkillsDirectoryProvider(roots=skills_dir, reload=True)
-
-        # Initial load
-        resources = await provider.list_resources()
-        assert len(resources) == 4
-
-        # Add a new skill
-        new_skill = skills_dir / "new-skill"
-        new_skill.mkdir()
-        (new_skill / "SKILL.md").write_text(
-            """---
-description: A new skill
----
-
-# New Skill
-"""
-        )
-
-        # Reload should pick up the new skill
-        resources = await provider.list_resources()
-        assert len(resources) == 6
-
-    async def test_skill_without_frontmatter_uses_header_as_description(
-        self, tmp_path: Path
-    ):
-        skills_dir = tmp_path / "skills"
-        skills_dir.mkdir()
-        skill = skills_dir / "no-frontmatter"
-        skill.mkdir()
-        (skill / "SKILL.md").write_text("# My Skill Title\n\nSome content.")
-
-        provider = SkillsDirectoryProvider(roots=skills_dir)
-        resources = await provider.list_resources()
-
-        main_resource = next(
-            r for r in resources if r.name == "no-frontmatter/SKILL.md"
-        )
-        assert main_resource.description == "My Skill Title"
-
-    async def test_supporting_files_as_resources(self, skills_dir: Path):
-        """Test that supporting_files='resources' shows all files."""
-        provider = SkillsDirectoryProvider(
-            roots=skills_dir, supporting_files="resources"
-        )
-        resources = await provider.list_resources()
-
-        # 2 skills * 2 standard resources + complex skill has 2 supporting files
-        # simple-skill: SKILL.md, _manifest (2)
-        # complex-skill: SKILL.md, _manifest, reference.md, scripts/helper.py (4)
-        assert len(resources) == 6
-
-        names = {r.name for r in resources}
-        assert "complex-skill/reference.md" in names
-        assert "complex-skill/scripts/helper.py" in names
-
-    async def test_supporting_files_as_resources_no_templates(self, skills_dir: Path):
-        """In resources mode, no templates should be exposed."""
-        provider = SkillsDirectoryProvider(
-            roots=skills_dir, supporting_files="resources"
-        )
-        templates = await provider.list_resource_templates()
-        assert templates == []
-
-
-class TestMultiDirectoryProvider:
-    """Tests for multi-directory support in SkillsDirectoryProvider."""
-
-    @pytest.fixture
-    def multi_skills_dirs(self, tmp_path: Path) -> tuple[Path, Path]:
-        """Create two separate skills directories."""
-        root1 = tmp_path / "skills1"
-        root1.mkdir()
-        skill1 = root1 / "skill-a"
-        skill1.mkdir()
-        (skill1 / "SKILL.md").write_text(
-            """---
-description: Skill A from root 1
----
-# Skill A
-"""
-        )
-
-        root2 = tmp_path / "skills2"
-        root2.mkdir()
-        skill2 = root2 / "skill-b"
-        skill2.mkdir()
-        (skill2 / "SKILL.md").write_text(
-            """---
-description: Skill B from root 2
----
-# Skill B
-"""
-        )
-
-        return root1, root2
-
-    async def test_multiple_roots_discover_all_skills(self, multi_skills_dirs):
-        """Test that skills from multiple roots are all discovered."""
-        root1, root2 = multi_skills_dirs
-        provider = SkillsDirectoryProvider(roots=[root1, root2])
-
-        resources = await provider.list_resources()
-        # 2 skills * 2 resources each = 4 total
-        assert len(resources) == 4
-
-        resource_names = {r.name for r in resources}
-        assert "skill-a/SKILL.md" in resource_names
-        assert "skill-a/_manifest" in resource_names
-        assert "skill-b/SKILL.md" in resource_names
-        assert "skill-b/_manifest" in resource_names
-
-    async def test_duplicate_skill_names_first_wins(self, tmp_path: Path):
-        """Test that if a skill appears in multiple roots, first one wins."""
-        root1 = tmp_path / "root1"
-        root1.mkdir()
-        skill1 = root1 / "duplicate-skill"
-        skill1.mkdir()
-        (skill1 / "SKILL.md").write_text(
-            """---
-description: First occurrence
----
-# First
-"""
-        )
-
-        root2 = tmp_path / "root2"
-        root2.mkdir()
-        skill2 = root2 / "duplicate-skill"
-        skill2.mkdir()
-        (skill2 / "SKILL.md").write_text(
-            """---
-description: Second occurrence
----
-# Second
-"""
-        )
-
-        provider = SkillsDirectoryProvider(roots=[root1, root2])
-        resources = await provider.list_resources()
-
-        # Should only have one skill (first one)
-        assert len(resources) == 2  # SKILL.md + _manifest
-
-        # Should be the first one
-        main_resource = next(
-            r for r in resources if r.name == "duplicate-skill/SKILL.md"
-        )
-        assert main_resource.description == "First occurrence"
-
-    async def test_single_path_as_list(self, multi_skills_dirs):
-        """Test that single path can be passed as a list."""
-        root1, _ = multi_skills_dirs
-        provider = SkillsDirectoryProvider(roots=[root1])
-
-        resources = await provider.list_resources()
-        assert len(resources) == 2  # skill-a has 2 resources
-
-    async def test_single_path_as_string(self, multi_skills_dirs):
-        """Test that single path can be passed as string."""
-        root1, _ = multi_skills_dirs
-        provider = SkillsDirectoryProvider(roots=str(root1))
-
-        resources = await provider.list_resources()
-        assert len(resources) == 2
-
-    async def test_nonexistent_roots_handled_gracefully(self, tmp_path: Path):
-        """Test that non-existent roots don't cause errors."""
-        existent = tmp_path / "exists"
-        existent.mkdir()
-        skill = existent / "test-skill"
-        skill.mkdir()
-        (skill / "SKILL.md").write_text("# Test\n\nContent")
-
-        nonexistent = tmp_path / "does-not-exist"
-
-        provider = SkillsDirectoryProvider(roots=[existent, nonexistent])
-        resources = await provider.list_resources()
-
-        # Should still find skills from existing root
-        assert len(resources) == 2
-
-    async def test_empty_roots_list(self, tmp_path: Path):
-        """Test that empty roots list results in no skills."""
-        provider = SkillsDirectoryProvider(roots=[])
-        resources = await provider.list_resources()
-        assert resources == []
-
-
-class TestClaudeSkillsProvider:
-    def test_default_root_is_claude_skills_dir(self, tmp_path: Path, monkeypatch):
-        # Mock Path.home() to return a temp path (use tmp_path for cross-platform compatibility)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-        provider = ClaudeSkillsProvider()
-        assert provider._roots == [tmp_path / ".claude" / "skills"]
-
-    def test_main_file_name_is_skill_md(self):
-        provider = ClaudeSkillsProvider()
-        assert provider._main_file_name == "SKILL.md"
-
-    def test_supporting_files_parameter(self):
-        provider = ClaudeSkillsProvider(supporting_files="resources")
-        assert provider._supporting_files == "resources"
-
-
-class TestPathTraversalPrevention:
-    async def test_path_traversal_blocked(self, tmp_path: Path):
-        skills_dir = tmp_path / "skills"
-        skills_dir.mkdir()
-        skill = skills_dir / "test-skill"
-        skill.mkdir()
-        (skill / "SKILL.md").write_text("# Test\n\nContent")
-
-        # Create a file outside the skill directory
-        secret_file = tmp_path / "secret.txt"
-        secret_file.write_text("SECRET DATA")
-
-        mcp = FastMCP("Test")
-        mcp.add_provider(SkillsDirectoryProvider(roots=skills_dir))
-
-        async with Client(mcp) as client:
-            # Path traversal attempts should fail — the secret must never be returned
-            with pytest.raises(Exception):
-                await client.read_resource(
-                    AnyUrl("skill://test-skill/../../../secret.txt")
-                )
-
-
-# Attack corpus mirroring the shapes exercised by the SDK's
-# mcp.shared.path_security tests: dot-dot traversal (bare, nested,
-# trailing), absolute-path injection (POSIX and Windows drive forms),
-# and null-byte injection. Each must be rejected before any filesystem
-# access, regardless of which skill surface receives it.
-SKILL_PATH_ESCAPES = [
-    "..",
-    "../secret.txt",
-    "../../../etc/passwd",
-    "sub/../../secret.txt",
-    "nested/../../outside.txt",
-    "/etc/passwd",
-    "/absolute/injection.txt",
-    "C:\\Windows\\system32",
-    "C:relative.txt",
-    "good\x00/../../../etc/passwd",
-    "file\x00.txt",
-]
-
-
-class TestPathSafetyAttackCorpus:
-    """Pin path-safety guards against the SDK's attack-shape corpus.
-
-    Every skill file surface routes user-supplied path parameters through
-    the SDK's ``safe_join``. These tests assert the whole corpus is
-    rejected with a clear error before the filesystem is touched, and
-    that legitimate nested paths continue to resolve.
-    """
-
-    @pytest.fixture
-    def skill_with_secret(self, tmp_path: Path) -> Path:
-        """A skill dir containing a nested file, with a secret one level up."""
-        skill_dir = tmp_path / "corpus-skill"
-        skill_dir.mkdir()
-        (skill_dir / "SKILL.md").write_text("# Corpus\n\nContent")
-        (skill_dir / "docs").mkdir()
-        (skill_dir / "docs" / "nested.txt").write_text("NESTED OK")
-        (tmp_path / "secret.txt").write_text("SECRET DATA")
-        return skill_dir
-
-    async def _template(self, skill_dir: Path):
-        provider = SkillProvider(skill_path=skill_dir)
-        templates = await provider.list_resource_templates()
-        return templates[0]
-
-    @pytest.mark.parametrize("attack", SKILL_PATH_ESCAPES)
-    async def test_template_read_rejects_escape(
-        self, skill_with_secret: Path, attack: str
-    ):
-        template = await self._template(skill_with_secret)
-        with pytest.raises(ValueError, match="Invalid path"):
-            await template.read(arguments={"path": attack})
-
-    @pytest.mark.parametrize("attack", SKILL_PATH_ESCAPES)
-    async def test_template_create_resource_rejects_escape(
-        self, skill_with_secret: Path, attack: str
-    ):
-        template = await self._template(skill_with_secret)
-        with pytest.raises(ValueError, match="Invalid path"):
-            await template.create_resource(
-                uri=f"skill://corpus-skill/{attack}", params={"path": attack}
-            )
-
-    @pytest.mark.parametrize("attack", SKILL_PATH_ESCAPES)
-    async def test_file_resource_read_rejects_escape(
-        self, skill_with_secret: Path, attack: str
-    ):
-        provider = SkillProvider(
-            skill_path=skill_with_secret, supporting_files="resources"
-        )
-        resource = SkillFileResource(
-            uri=AnyUrl("skill://corpus-skill/x"),
-            name="corpus-skill/x",
-            mime_type="text/plain",
-            skill_info=provider.skill_info,
-            file_path=attack,
-        )
-        with pytest.raises(ValueError, match="Invalid path"):
-            await resource.read()
-
-    async def test_template_read_allows_nested_path(self, skill_with_secret: Path):
-        template = await self._template(skill_with_secret)
-        result = await template.read(arguments={"path": "docs/nested.txt"})
-        assert result == "NESTED OK"
-
-    async def test_template_read_allows_within_bounds_dotdot(
-        self, skill_with_secret: Path
-    ):
-        template = await self._template(skill_with_secret)
-        result = await template.read(arguments={"path": "docs/../docs/nested.txt"})
-        assert result == "NESTED OK"
-
-    async def test_file_resource_read_allows_nested_path(self, skill_with_secret: Path):
-        provider = SkillProvider(
-            skill_path=skill_with_secret, supporting_files="resources"
-        )
-        resource = SkillFileResource(
-            uri=AnyUrl("skill://corpus-skill/docs/nested.txt"),
-            name="corpus-skill/docs/nested.txt",
-            mime_type="text/plain",
-            skill_info=provider.skill_info,
-            file_path="docs/nested.txt",
-        )
-        assert await resource.read() == "NESTED OK"
-
-
-async def test_skill_provider_loads_and_serves_utf8_skill_md(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """SKILL.md and its supporting text files must be read as utf-8.
-
-    Regression test for #4084. On Windows the default encoding is cp1252,
-    so a bare ``read_text()`` call fails to decode UTF-8 content with
-    ``UnicodeDecodeError: 'charmap' codec can't decode byte ...``. The fix
-    passes ``encoding="utf-8"`` explicitly at every read site: skill load,
-    main-file resource read, and supporting-file template/resource reads.
-    This test simulates the Windows behavior on any platform by failing
-    every text read that doesn't pass ``encoding="utf-8"``.
-    """
-    skill_dir = tmp_path / "test-skill"
-    skill_dir.mkdir()
+def _write_skill(root, name: str, *, instructions: str = "Use this skill.") -> None:
+    skill_dir = root / name
+    skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
-        "---\n"
-        "name: test-skill\n"
-        "description: Test skill with UTF-8 characters\n"
-        "---\n"
-        "# Test Skill 🎯\n"
-        "- ✅ Success indicator\n",
+        f"---\nname: {name}\ndescription: A {name} skill.\n---\n{instructions}",
         encoding="utf-8",
     )
-    (skill_dir / "reference.md").write_text(
-        "# Reference\n- ✨ utf-8 supporting file\n", encoding="utf-8"
+
+
+def test_skill_is_a_snapshot_and_validates_files(tmp_path):
+    source = tmp_path / "refunds"
+    _write_skill(source, "refunds")
+    skill_dir = source / "refunds"
+    (skill_dir / "policy.md").write_bytes(b"policy\x00")
+
+    skill = Skill.from_directory(skill_dir)
+    (skill_dir / "policy.md").write_text("changed", encoding="utf-8")
+
+    assert skill.name == "refunds"
+    assert skill.files["policy.md"] == b"policy\x00"
+    with pytest.raises(TypeError):
+        cast(dict[str, bytes], skill.files)["policy.md"] = b"mutable"
+
+
+def test_skill_from_package_keeps_exact_file_bytes(tmp_path, monkeypatch):
+    package = tmp_path / "example_skill_assets"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    _write_skill(package, "refunds")
+    (package / "refunds" / "policy.bin").write_bytes(b"\x00\xff")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    skill = Skill.from_package("example_skill_assets", "refunds")
+    assert skill.name == "refunds"
+    assert skill.files["policy.bin"] == b"\x00\xff"
+
+
+def test_skill_preserves_frontmatter_bytes_and_rejects_file_directory_conflicts():
+    main = b"---\r\nname: raw\r\ndescription: Raw bytes.\r\n---\r\nUse raw bytes.\r\n"
+    skill = Skill.from_files({"SKILL.md": main})
+    assert skill.files["SKILL.md"] == main
+
+    with pytest.raises(ValueError, match="file is also used as a directory"):
+        Skill.from_files(
+            {
+                "SKILL.md": "---\nname: raw\ndescription: Raw bytes.\n---\nUse raw bytes.",
+                "reference": "file",
+                "reference/guide.md": "nested",
+            }
+        )
+
+
+def test_skill_frontmatter_is_deeply_immutable():
+    metadata = {"metadata": {"team": "support"}}
+    skill = Skill(
+        name="workflow",
+        description="A workflow.",
+        instructions="Follow the workflow.",
+        frontmatter=metadata,
     )
+    metadata["metadata"]["team"] = "mutated"
 
-    original_read_text = Path.read_text
+    assert skill.frontmatter["metadata"]["team"] == "support"
+    with pytest.raises(TypeError):
+        cast(dict[str, str], skill.frontmatter["metadata"])["new"] = "value"
 
-    def strict_read_text(self: Path, *args, **kwargs):
-        if kwargs.get("encoding") != "utf-8":
-            raise UnicodeDecodeError(
-                "charmap", b"\x9d", 0, 1, "simulated cp1252 default"
+
+@pytest.mark.parametrize(
+    "frontmatter",
+    [
+        {"compatibility": "x" * 501},
+        {"compatibility": None},
+        {"metadata": {"tags": ["billing"]}},
+        {"metadata": None},
+        {"allowed-tools": ["Read"]},
+        {"allowed-tools": None},
+    ],
+)
+def test_skill_rejects_invalid_optional_frontmatter(frontmatter):
+    with pytest.raises(ValueError):
+        Skill(
+            name="refunds",
+            description="Refunds.",
+            instructions="Use refunds.",
+            frontmatter=frontmatter,
+        )
+
+
+def test_skill_publication_uri_must_match_skill_name():
+    skill = Skill(name="refunds", description="Refunds.", instructions="Use refunds.")
+    with pytest.raises(ValueError, match="skill-name"):
+        SkillProvider(skill, uri="github://company/repo/other/SKILL.md")
+    with pytest.raises(ValueError, match="skill-name"):
+        SkillPublication(skill, uri="github://company/repo/other/SKILL.md")
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["../escape", "/absolute", "a//b", "a\\b", "a/../b"],
+)
+def test_skill_rejects_unsafe_paths(path):
+    with pytest.raises(ValueError, match="Invalid skill path"):
+        Skill.from_files(
+            {
+                "SKILL.md": "---\nname: safe\ndescription: Safe.\n---\nDo this.",
+                path: "unsafe",
+            }
+        )
+
+
+@pytest.mark.anyio
+async def test_skill_extension_list_get_verified_read_and_directory_read():
+    skill = Skill(
+        name="refunds",
+        description="Help with refunds.",
+        instructions="Use the refund API.",
+        files={
+            "references/policy.md": "Refund policy.",
+            "assets/pixel.bin": b"\x00\xff",
+        },
+    )
+    server = FastMCP("skills")
+    server.add_provider(SkillProvider(skill))
+    server.add_extension(SkillsExtension())
+
+    async with Client(server) as client:
+        listed = await client.list_skills_mcp()
+        assert len(listed.skills) == 1
+        assert listed.skills[0].uri == "skill://refunds/SKILL.md"
+        assert listed.skills[0].resources != "dynamic"
+
+        remote = await client.get_skill("skill://refunds/SKILL.md")
+        main = await remote.read()
+        assert main.verified
+        assert main.text.endswith("Use the refund API.")
+        assert main.origin == client.name
+
+        reference = await remote.read("references/policy.md")
+        assert reference.verified
+        assert reference.data == b"Refund policy."
+        binary = await remote.read("assets/pixel.bin")
+        assert binary.data == b"\x00\xff"
+        assert binary.verified
+
+        directory = await client.read_resource_directory("skill://refunds")
+        assert {str(item.uri) for item in directory} == {
+            "skill://refunds/SKILL.md",
+            "skill://refunds/assets",
+            "skill://refunds/references",
+        }
+        children = await client.read_resource_directory("skill://refunds/references")
+        assert [str(item.uri) for item in children] == [
+            "skill://refunds/references/policy.md"
+        ]
+
+
+@pytest.mark.anyio
+async def test_skills_extension_forwards_through_proxy_provider():
+    skill = Skill(
+        name="refunds",
+        description="Help with refunds.",
+        instructions="Use the refund API.",
+        files={"references/policy.md": "Refund policy."},
+    )
+    upstream = FastMCP("upstream")
+    upstream.add_provider(SkillProvider(skill))
+    upstream.add_extension(SkillsExtension())
+
+    proxy = FastMCP("proxy")
+    proxy.add_provider(ProxyProvider(lambda: Client(upstream)), namespace="upstream")
+    proxy.add_extension(SkillsExtension())
+
+    async with Client(proxy) as client:
+        [remote_skill] = await client.list_skills()
+        assert remote_skill.uri == "skill://upstream/refunds/SKILL.md"
+        assert (await remote_skill.read()).verified
+        directory = await client.read_resource_directory("skill://upstream/refunds")
+        assert {str(item.uri) for item in directory} == {
+            "skill://upstream/refunds/SKILL.md",
+            "skill://upstream/refunds/references",
+        }
+        policy = await remote_skill.read("references/policy.md")
+        assert policy.text == "Refund policy."
+
+
+@pytest.mark.anyio
+async def test_proxy_keeps_same_uri_skills_in_separate_namespaces():
+    def upstream(name: str) -> FastMCP:
+        server = FastMCP(name)
+        server.add_provider(
+            SkillProvider(
+                Skill(
+                    name="refunds",
+                    description=f"{name} refunds.",
+                    instructions=f"Use {name} policy.",
+                    files={"policy.md": f"{name} policy."},
+                )
             )
-        return original_read_text(self, *args, **kwargs)
+        )
+        server.add_extension(SkillsExtension())
+        return server
 
-    monkeypatch.setattr(Path, "read_text", strict_read_text)
+    billing = upstream("billing")
+    support = upstream("support")
+    proxy = FastMCP("proxy")
+    proxy.add_provider(ProxyProvider(lambda: Client(billing)), namespace="billing")
+    proxy.add_provider(ProxyProvider(lambda: Client(support)), namespace="support")
+    proxy.add_extension(SkillsExtension())
 
-    mcp = FastMCP("Test")
-    mcp.add_provider(SkillProvider(skill_path=skill_dir))
+    async with Client(proxy) as client:
+        skills = {skill.uri: skill for skill in await client.list_skills()}
+        for name in ("billing", "support"):
+            skill = skills[f"skill://{name}/refunds/SKILL.md"]
+            assert (await skill.read("policy.md")).text == f"{name} policy."
 
-    async with Client(mcp) as client:
-        main = await client.read_resource(AnyUrl("skill://test-skill/SKILL.md"))
-        assert isinstance(main[0], TextResourceContents)
-        assert "🎯" in main[0].text
 
-        ref = await client.read_resource(AnyUrl("skill://test-skill/reference.md"))
-        assert isinstance(ref[0], TextResourceContents)
-        assert "✨" in ref[0].text
+@pytest.mark.anyio
+async def test_proxy_lists_same_upstream_mounted_twice():
+    upstream = FastMCP("upstream")
+    upstream.add_provider(
+        SkillProvider(
+            Skill(name="refunds", description="Refunds.", instructions="Use refunds.")
+        )
+    )
+    upstream.add_extension(SkillsExtension())
+
+    def client_factory() -> Client:
+        return Client(upstream)
+
+    proxy = FastMCP("proxy")
+    proxy.add_provider(ProxyProvider(client_factory), namespace="one")
+    proxy.add_provider(ProxyProvider(client_factory), namespace="two")
+    proxy.add_extension(SkillsExtension())
+
+    async with Client(proxy) as client:
+        skills = await client.list_skills()
+        assert {skill.uri for skill in skills} == {
+            "skill://one/refunds/SKILL.md",
+            "skill://two/refunds/SKILL.md",
+        }
+
+
+@pytest.mark.anyio
+async def test_proxy_directory_read_works_when_upstream_does_not_advertise_it():
+    upstream = FastMCP("upstream")
+    upstream.add_provider(
+        SkillProvider(
+            Skill(
+                name="refunds",
+                description="Refunds.",
+                instructions="Use refunds.",
+                files={"policy.md": "Policy."},
+            )
+        )
+    )
+    upstream.add_extension(SkillsExtension(directory_read=False))
+    proxy = FastMCP("proxy")
+    proxy.add_provider(ProxyProvider(lambda: Client(upstream)))
+    proxy.add_extension(SkillsExtension())
+
+    async with Client(proxy) as client:
+        entries = await client.read_resource_directory("skill://refunds")
+        assert {str(item.uri) for item in entries} == {
+            "skill://refunds/SKILL.md",
+            "skill://refunds/policy.md",
+        }
+
+
+@pytest.mark.anyio
+async def test_proxy_directory_read_uses_visible_files_for_dynamic_upstream():
+    upstream = FastMCP("upstream")
+    upstream.add_provider(
+        SkillProvider(
+            Skill(
+                name="refunds",
+                description="Refunds.",
+                instructions="Use refunds.",
+                files={"references/policy.md": "Policy."},
+            ),
+            dynamic=True,
+        )
+    )
+    upstream.add_extension(SkillsExtension(directory_read=False))
+    proxy = FastMCP("proxy")
+    proxy.add_provider(ProxyProvider(lambda: Client(upstream)))
+    proxy.add_extension(SkillsExtension())
+
+    async with Client(proxy) as client:
+        entries = await client.read_resource_directory("skill://refunds")
+        assert {str(item.uri) for item in entries} == {
+            "skill://refunds/SKILL.md",
+            "skill://refunds/references",
+        }
+
+
+@pytest.mark.anyio
+async def test_skills_directory_provider_requires_explicit_reload(tmp_path):
+    _write_skill(tmp_path, "alpha")
+    provider = SkillsDirectoryProvider(tmp_path)
+    server = FastMCP("skills")
+    server.add_provider(provider)
+    server.add_extension(SkillsExtension())
+
+    async with Client(server) as client:
+        assert [
+            skill.frontmatter["name"]
+            for skill in (await client.list_skills_mcp()).skills
+        ] == ["alpha"]
+        _write_skill(tmp_path, "beta")
+        assert [
+            skill.frontmatter["name"]
+            for skill in (await client.list_skills_mcp()).skills
+        ] == ["alpha"]
+
+        await provider.reload()
+        assert [
+            skill.frontmatter["name"]
+            for skill in (await client.list_skills_mcp()).skills
+        ] == [
+            "alpha",
+            "beta",
+        ]
+
+
+@pytest.mark.anyio
+async def test_skills_directory_provider_can_auto_reload_for_development(tmp_path):
+    _write_skill(tmp_path, "alpha")
+    server = FastMCP("skills")
+    server.add_provider(SkillsDirectoryProvider(tmp_path, reload=True))
+    server.add_extension(SkillsExtension())
+
+    async with Client(server) as client:
+        _write_skill(tmp_path, "beta")
+        skills = await client.list_skills()
+        assert {skill.name for skill in skills} == {"alpha", "beta"}
+
+
+@pytest.mark.anyio
+async def test_failed_skills_directory_reload_keeps_previous_snapshot(tmp_path):
+    _write_skill(tmp_path, "alpha")
+    provider = SkillsDirectoryProvider(tmp_path)
+    (tmp_path / "broken").mkdir()
+    (tmp_path / "broken" / "SKILL.md").write_text("not frontmatter")
+
+    with pytest.raises(ValueError, match="frontmatter"):
+        await provider.reload()
+
+    server = FastMCP("skills")
+    server.add_provider(provider)
+    server.add_extension(SkillsExtension())
+    async with Client(server) as client:
+        skills = await client.list_skills()
+        assert [skill.name for skill in skills] == ["alpha"]
+        assert (await skills[0].read()).verified
+
+
+@pytest.mark.anyio
+async def test_skill_provider_composes_with_namespace_transforms():
+    server = FastMCP("skills")
+    server.add_provider(
+        SkillProvider(
+            Skill(name="refunds", description="Refunds.", instructions="Check policy.")
+        ),
+        namespace="billing",
+    )
+    server.add_extension(SkillsExtension())
+
+    async with Client(server) as client:
+        skill = await client.get_skill("skill://billing/refunds/SKILL.md")
+        assert skill.name == "refunds"
+        assert (await skill.read()).verified
+
+
+@pytest.mark.anyio
+async def test_skill_provider_preserves_custom_uri_through_protocol():
+    server = FastMCP("skills")
+    server.add_provider(
+        SkillProvider(
+            Skill(name="refunds", description="Refunds.", instructions="Check policy."),
+            uri="catalog://billing/refunds/SKILL.md",
+        )
+    )
+    server.add_extension(SkillsExtension())
+
+    async with Client(server) as client:
+        skill = await client.get_skill("catalog://billing/refunds/SKILL.md")
+        assert skill.uri == "catalog://billing/refunds/SKILL.md"
+        assert (await skill.read()).verified
+
+
+@pytest.mark.anyio
+async def test_skill_list_respects_resource_authorization():
+    server = FastMCP("skills")
+    server.add_provider(
+        SkillProvider(
+            Skill(
+                name="restricted",
+                description="Restricted skill.",
+                instructions="Do not disclose this skill.",
+            ),
+            auth=lambda _context: False,
+        )
+    )
+    server.add_extension(SkillsExtension())
+
+    async with Client(server) as client:
+        assert await client.list_skills() == []
+
+
+@pytest.mark.anyio
+async def test_skill_manifest_does_not_advertise_unreadable_files():
+    class HidePolicy(Transform):
+        async def list_resources(self, resources):
+            return [r for r in resources if not str(r.uri).endswith("/policy.md")]
+
+        async def get_resource(self, uri, call_next, *, version=None):
+            if uri.endswith("/policy.md"):
+                return None
+            return await call_next(uri, version=version)
+
+    server = FastMCP("skills")
+    server.add_provider(
+        SkillProvider(
+            Skill(
+                name="refunds",
+                description="Refunds.",
+                instructions="Use refunds.",
+                files={"policy.md": "Restricted policy."},
+            )
+        )
+    )
+    server.add_transform(HidePolicy())
+    server.add_extension(SkillsExtension())
+
+    async with Client(server) as client:
+        assert await client.list_skills() == []
+        with pytest.raises(MCPError):
+            await client.get_skill("skill://refunds/SKILL.md")
+
+
+@pytest.mark.anyio
+async def test_skill_manifest_hashes_content_after_resource_transform():
+    class ReplacePolicy(Transform):
+        async def get_resource(self, uri, call_next, *, version=None):
+            resource = await call_next(uri, version=version)
+            if resource is not None and uri.endswith("/policy.md"):
+                return TextResource(
+                    uri=resource.uri,
+                    name=resource.name,
+                    text="Current policy.",
+                )
+            return resource
+
+    server = FastMCP("skills")
+    server.add_provider(
+        SkillProvider(
+            Skill(
+                name="refunds",
+                description="Refunds.",
+                instructions="Use refunds.",
+                files={"policy.md": "Original policy."},
+            )
+        )
+    )
+    server.add_transform(ReplacePolicy())
+    server.add_extension(SkillsExtension())
+
+    async with Client(server) as client:
+        skill = await client.get_skill("skill://refunds/SKILL.md")
+        policy = await skill.read("policy.md")
+        assert policy.verified
+        assert policy.text == "Current policy."
+
+
+@pytest.mark.anyio
+async def test_skill_with_failing_resource_read_is_not_advertised():
+    class UnreadableResource(Resource):
+        async def read(self) -> bytes:
+            raise PermissionError("not available")
+
+    class ReplacePolicy(Transform):
+        async def get_resource(self, uri, call_next, *, version=None):
+            resource = await call_next(uri, version=version)
+            if resource is not None and uri.endswith("/policy.md"):
+                return UnreadableResource(uri=resource.uri, name=resource.name)
+            return resource
+
+    server = FastMCP("skills")
+    server.add_provider(
+        SkillProvider(
+            Skill(
+                name="refunds",
+                description="Refunds.",
+                instructions="Use refunds.",
+                files={"policy.md": "Policy."},
+            )
+        )
+    )
+    server.add_transform(ReplacePolicy())
+    server.add_extension(SkillsExtension())
+
+    async with Client(server) as client:
+        assert await client.list_skills() == []
+
+
+@pytest.mark.anyio
+async def test_application_catalog_publishes_without_a_filesystem_source():
+    publication = SkillPublication(
+        Skill(
+            name="refunds",
+            description="Refunds from the billing catalog.",
+            instructions="Check the live billing policy.",
+            files={"references/policy.md": "Policy stored in the database."},
+        ),
+        uri="skill://database/refunds/SKILL.md",
+    )
+    list_calls = 0
+
+    async def list_publications() -> list[SkillPublication]:
+        nonlocal list_calls
+        list_calls += 1
+        return [publication]
+
+    async def get_publication(uri: str) -> SkillPublication | None:
+        return publication if uri.startswith("skill://database/refunds/") else None
+
+    server = FastMCP("database skills")
+    server.add_provider(
+        SkillCatalogProvider(
+            list_publications,
+            get_publication=get_publication,
+        )
+    )
+    server.add_extension(SkillsExtension())
+
+    async with Client(server) as client:
+        list_calls = 0
+        skill = await client.get_skill("skill://database/refunds/SKILL.md")
+        assert list_calls == 0
+        policy = await skill.read("references/policy.md")
+        assert policy.text == "Policy stored in the database."
+        assert list_calls == 0
+
+
+@pytest.mark.anyio
+async def test_directory_read_can_find_skill_omitted_from_catalog_listing():
+    publications = {
+        name: SkillPublication(
+            Skill(
+                name=name,
+                description=f"{name} skill.",
+                instructions=f"Use {name}.",
+                files={"guide.md": "Guide."},
+            )
+        )
+        for name in ("alpha", "beta")
+    }
+
+    async def list_publications() -> list[SkillPublication]:
+        return [publications["alpha"]]
+
+    async def get_publication(uri: str) -> SkillPublication | None:
+        for name, publication in publications.items():
+            if uri.startswith(f"skill://{name}/"):
+                return publication
+        return None
+
+    server = FastMCP("catalog")
+    server.add_provider(
+        SkillCatalogProvider(list_publications, get_publication=get_publication)
+    )
+    server.add_extension(SkillsExtension())
+
+    async with Client(server) as client:
+        assert (await client.get_skill("skill://beta/SKILL.md")).name == "beta"
+        children = await client.read_resource_directory("skill://beta")
+        assert {str(item.uri) for item in children} == {
+            "skill://beta/SKILL.md",
+            "skill://beta/guide.md",
+        }
+
+
+@pytest.mark.anyio
+async def test_nested_skills_are_listed_independently_and_remain_parent_files(tmp_path):
+    outer_dir = tmp_path / "outer"
+    _write_skill(tmp_path, "outer")
+    nested_root = outer_dir / "nested"
+    nested_root.mkdir()
+    _write_skill(nested_root, "inner")
+    provider = SkillsDirectoryProvider(tmp_path)
+    server = FastMCP("skills")
+    server.add_provider(provider)
+    server.add_extension(SkillsExtension())
+
+    async with Client(server) as client:
+        skills = await client.list_skills()
+        assert {skill.name for skill in skills} == {"outer", "inner"}
+        outer = next(skill for skill in skills if skill.name == "outer")
+        nested_file = await outer.read("nested/inner/SKILL.md")
+        assert nested_file.verified
+
+
+@pytest.mark.anyio
+async def test_skill_directory_read_includes_empty_nested_directories():
+    skill = Skill(
+        name="refunds",
+        description="Refunds.",
+        instructions="Use refunds.",
+        directories=("empty/nested",),
+    )
+    server = FastMCP("skills")
+    server.add_provider(SkillProvider(skill))
+    server.add_extension(SkillsExtension())
+
+    async with Client(server) as client:
+        root = await client.read_resource_directory("skill://refunds")
+        assert {str(item.uri) for item in root} == {
+            "skill://refunds/SKILL.md",
+            "skill://refunds/empty",
+        }
+        nested = await client.read_resource_directory("skill://refunds/empty")
+        assert [str(item.uri) for item in nested] == ["skill://refunds/empty/nested"]

@@ -220,6 +220,10 @@ REMOVED_MODULES = [
     "fastmcp.experimental.sampling",  # -> fastmcp.client.sampling
     "fastmcp.experimental.sampling.handlers",  # -> fastmcp.client.sampling.handlers
     "fastmcp.server.auth.authorization",  # -> fastmcp.server.auth / fastmcp.utilities.authorization
+    # Replaced by the SEP-2640 Skills extension and virtual Skill API.
+    "fastmcp.utilities.skills",
+    "fastmcp.server.providers.skills.claude_provider",
+    "fastmcp.server.providers.skills.vendor_providers",
 ]
 
 # Names that were re-export shims and are gone; import them from the canonical

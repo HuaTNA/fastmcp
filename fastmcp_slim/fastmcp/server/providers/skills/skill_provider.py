@@ -1,452 +1,328 @@
-"""Basic skill provider for handling a single skill folder."""
+"""Providers for immutable virtual Agent Skills."""
 
 from __future__ import annotations
 
-import json
 import mimetypes
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, cast
-from urllib.parse import quote, unquote
+from typing import Any
+from urllib.parse import quote
 
-from mcp.shared.path_security import PathEscapeError, safe_join
-from pydantic import AnyUrl
+import anyio
+from pydantic import AnyUrl, Field
 
-from fastmcp.resources.base import Resource, ResourceResult
+from fastmcp.resources.base import Resource
 from fastmcp.resources.template import ResourceTemplate
 from fastmcp.server.providers.base import Provider
-from fastmcp.server.providers.skills._common import (
-    SkillInfo,
-    parse_frontmatter,
-    scan_skill_files,
-)
-from fastmcp.utilities.logging import get_logger
+from fastmcp.skills import Skill, _validate_relative_path, _validate_skill_uri
+from fastmcp.utilities.authorization import AuthCheck
 from fastmcp.utilities.versions import VersionSpec
 
-logger = get_logger(__name__)
 
-# Ensure .md is recognized as text/markdown on all platforms (Windows may not have this)
-mimetypes.add_type("text/markdown", ".md")
-
-
-# -----------------------------------------------------------------------------
-# Skill-specific Resource and ResourceTemplate subclasses
-# -----------------------------------------------------------------------------
+def skill_file_uri(root_uri: str, relative_path: str) -> str:
+    """Return a resource URI under a skill root, quoting each path segment."""
+    suffix = "/".join(quote(part, safe="") for part in relative_path.split("/"))
+    return f"{root_uri.removesuffix('/SKILL.md')}/{suffix}"
 
 
 class SkillResource(Resource):
-    """A resource representing a skill's main file or manifest."""
+    """A projected resource owned by a virtual skill publication."""
 
-    skill_info: SkillInfo
-    is_manifest: bool = False
-
-    def get_meta(self) -> dict[str, Any]:
-        meta = super().get_meta()
-        fastmcp = cast(dict[str, Any], meta["fastmcp"])
-        fastmcp["skill"] = {
-            "name": self.skill_info.name,
-            "is_manifest": self.is_manifest,
-        }
-        return meta
-
-    async def read(self) -> str | bytes | ResourceResult:
-        """Read the resource content."""
-        if self.is_manifest:
-            return self._generate_manifest()
-        else:
-            main_file_path = self.skill_info.path / self.skill_info.main_file
-            return main_file_path.read_text(encoding="utf-8")
-
-    def _generate_manifest(self) -> str:
-        """Generate JSON manifest for the skill."""
-        manifest = {
-            "skill": self.skill_info.name,
-            "files": [
-                {"path": f.path, "size": f.size, "hash": f.hash}
-                for f in self.skill_info.files
-            ],
-        }
-        return json.dumps(manifest, indent=2)
-
-
-class SkillFileTemplate(ResourceTemplate):
-    """A template for accessing files within a skill."""
-
-    skill_info: SkillInfo
-
-    async def read(self, arguments: dict[str, Any]) -> str | bytes | ResourceResult:
-        """Read a file from the skill directory."""
-        file_path = arguments.get("path", "")
-
-        # Security: reject traversal, absolute-path injection, null bytes, and
-        # symlink escapes before touching the filesystem.
-        try:
-            full_path = safe_join(self.skill_info.path, file_path)
-        except PathEscapeError as e:
-            raise ValueError(f"Invalid path: {e}") from e
-
-        if not full_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
-
-        if not full_path.is_file():
-            raise ValueError(f"Not a file: {file_path}")
-
-        # Determine if binary or text based on mime type
-        mime_type, _ = mimetypes.guess_type(str(full_path))
-        if mime_type and mime_type.startswith("text/"):
-            return full_path.read_text(encoding="utf-8")
-        else:
-            return full_path.read_bytes()
-
-    async def _read(
-        self,
-        uri: str,
-        params: dict[str, Any],
-    ) -> ResourceResult:
-        """Server entry point - read file directly without creating ephemeral resource."""
-        # Call read() directly and convert to ResourceResult
-        result = await self.read(arguments=params)
-        return self.convert_result(result)
-
-    async def create_resource(self, uri: str, params: dict[str, Any]) -> Resource:
-        """Create a resource for the given URI and parameters.
-
-        Note: This is not typically used since _read() handles file reading directly.
-        Provided for compatibility with the ResourceTemplate interface.
-        """
-        file_path = params.get("path", "")
-
-        # Security: reject traversal, absolute-path injection, null bytes, and
-        # symlink escapes before touching the filesystem.
-        try:
-            full_path = safe_join(self.skill_info.path, file_path)
-        except PathEscapeError as e:
-            raise ValueError(f"Invalid path: {e}") from e
-
-        mime_type, _ = mimetypes.guess_type(str(full_path))
-
-        # Create a SkillFileResource that can read the file
-        return SkillFileResource(
-            uri=AnyUrl(uri),
-            name=f"{self.skill_info.name}/{file_path}",
-            description=f"File from {self.skill_info.name} skill",
-            mime_type=mime_type or "application/octet-stream",
-            skill_info=self.skill_info,
-            file_path=file_path,
-        )
-
-
-class SkillFileResource(Resource):
-    """A resource representing a specific file within a skill."""
-
-    skill_info: SkillInfo
+    skill: Any = Field(exclude=True, repr=False)
+    skill_uri: str
     file_path: str
+    skill_dynamic: bool = False
 
-    def get_meta(self) -> dict[str, Any]:
-        meta = super().get_meta()
-        fastmcp = cast(dict[str, Any], meta["fastmcp"])
-        fastmcp["skill"] = {
-            "name": self.skill_info.name,
-        }
-        return meta
+    async def read(self) -> bytes:
+        return self.skill.files[self.file_path]
 
-    async def read(self) -> str | bytes | ResourceResult:
-        """Read the file content."""
-        # Security: reject traversal, absolute-path injection, null bytes, and
-        # symlink escapes before touching the filesystem.
-        try:
-            full_path = safe_join(self.skill_info.path, self.file_path)
-        except PathEscapeError as e:
-            raise ValueError(f"Invalid path: {e}") from e
 
-        if not full_path.exists():
-            raise FileNotFoundError(f"File not found: {self.file_path}")
+@dataclass(frozen=True)
+class SkillPublication:
+    """Bind a storage-neutral skill to its public URI or provider path."""
 
-        mime_type, _ = mimetypes.guess_type(str(full_path))
-        if mime_type and mime_type.startswith("text/"):
-            return full_path.read_text(encoding="utf-8")
+    skill: Skill
+    path: str | None = None
+    uri: str | None = None
+    auth: AuthCheck | list[AuthCheck] | tuple[AuthCheck, ...] | None = None
+    tags: frozenset[str] = frozenset()
+    dynamic: bool = False
+
+    def __post_init__(self) -> None:
+        if self.path is not None and self.uri is not None:
+            raise ValueError("A skill publication accepts either path or uri, not both")
+        if self.path is None and self.uri is None:
+            object.__setattr__(self, "path", self.skill.name)
+        if self.path is not None:
+            path = _validate_relative_path(self.path)
+            if path.split("/")[-1] != self.skill.name:
+                raise ValueError("The final skill path segment must match Skill.name")
+            object.__setattr__(self, "path", path)
         else:
-            return full_path.read_bytes()
+            assert self.uri is not None
+            uri = _validate_skill_uri(self.uri, self.skill.name)
+            object.__setattr__(self, "uri", uri)
+        object.__setattr__(self, "tags", frozenset(self.tags))
+        if isinstance(self.auth, list):
+            object.__setattr__(self, "auth", tuple(self.auth))
+
+    @property
+    def root_uri(self) -> str:
+        if self.uri is not None:
+            return self.uri
+        assert self.path is not None
+        return f"skill://{self.path}/SKILL.md"
 
 
-# -----------------------------------------------------------------------------
-# SkillProvider - handles a SINGLE skill folder
-# -----------------------------------------------------------------------------
+def _resource(
+    skill: Skill,
+    root_uri: str,
+    file_path: str,
+    auth: AuthCheck | list[AuthCheck] | None,
+    *,
+    dynamic: bool = False,
+) -> SkillResource:
+    mime_type, _ = mimetypes.guess_type(file_path)
+    is_main = file_path == "SKILL.md"
+    return SkillResource(
+        uri=AnyUrl(skill_file_uri(root_uri, file_path)),
+        name=skill.name if is_main else f"{skill.name}/{file_path}",
+        description=skill.description if is_main else f"File from {skill.name} skill",
+        mime_type=(
+            "text/markdown" if is_main else mime_type or "application/octet-stream"
+        ),
+        skill=skill,
+        skill_uri=root_uri,
+        file_path=file_path,
+        skill_dynamic=dynamic,
+        auth=auth,
+    )
 
 
 class SkillProvider(Provider):
-    """Provider that exposes a single skill folder as MCP resources.
-
-    Each skill folder must contain a main file (default: SKILL.md) and may
-    contain additional supporting files.
-
-    Exposes:
-    - A Resource for the main file (skill://{name}/SKILL.md)
-    - A Resource for the synthetic manifest (skill://{name}/_manifest)
-    - Supporting files via ResourceTemplate or Resources (configurable)
-
-    Args:
-        skill_path: Path to the skill directory.
-        main_file_name: Name of the main skill file. Defaults to "SKILL.md".
-        supporting_files: How supporting files (everything except main file and
-            manifest) are exposed to clients:
-            - "template": Accessed via ResourceTemplate, hidden from list_resources().
-              Clients discover files by reading the manifest first.
-            - "resources": Each file exposed as individual Resource in list_resources().
-              Full enumeration upfront.
-
-    Example:
-        ```python
-        from pathlib import Path
-        from fastmcp import FastMCP
-        from fastmcp.server.providers.skills import SkillProvider
-
-        mcp = FastMCP("My Skill")
-        mcp.add_provider(SkillProvider(
-            Path.home() / ".claude/skills/pdf-processing"
-        ))
-        ```
-    """
+    """Publish one immutable :class:`Skill` through the resource provider API."""
 
     def __init__(
         self,
-        skill_path: str | Path,
-        main_file_name: str = "SKILL.md",
-        supporting_files: Literal["template", "resources"] = "template",
+        skill: Skill,
+        *,
+        path: str | None = None,
+        uri: str | None = None,
+        dynamic: bool = False,
+        auth: AuthCheck | list[AuthCheck] | None = None,
+        tags: set[str] | None = None,
     ) -> None:
         super().__init__()
-        self._skill_path = Path(skill_path).resolve()
-        self._main_file_name = main_file_name
-        self._supporting_files = supporting_files
-        self._skill_info: SkillInfo | None = None
-
-        # Load at init to catch errors early
-        self._load_skill()
-
-    def _load_skill(self) -> None:
-        """Load and parse the skill directory."""
-        main_file = self._skill_path / self._main_file_name
-
-        if not self._skill_path.exists():
-            raise FileNotFoundError(f"Skill directory not found: {self._skill_path}")
-
-        if not main_file.exists():
-            raise FileNotFoundError(
-                f"Main skill file not found: {main_file}. "
-                f"Expected {self._main_file_name} in {self._skill_path}"
-            )
-
-        content = main_file.read_text(encoding="utf-8")
-        frontmatter, body = parse_frontmatter(content)
-
-        # Get description from frontmatter or first non-empty line
-        description = frontmatter.get("description", "")
-        if not description:
-            for line in body.strip().split("\n"):
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    description = line[:200]
-                    break
-                elif line.startswith("#"):
-                    description = line.lstrip("#").strip()[:200]
-                    break
-
-        # Scan all files in the skill directory
-        files = scan_skill_files(self._skill_path)
-
-        self._skill_info = SkillInfo(
-            name=self._skill_path.name,
-            description=description or f"Skill: {self._skill_path.name}",
-            path=self._skill_path,
-            main_file=self._main_file_name,
-            files=files,
-            frontmatter=frontmatter,
-        )
-
-        logger.debug(f"SkillProvider loaded skill: {self._skill_info.name}")
+        if path is not None and uri is not None:
+            raise ValueError("Pass either path or uri, not both")
+        self.skill = skill
+        if uri is not None:
+            normalized_uri = _validate_skill_uri(uri, skill.name)
+            self.path = None
+            self._skill_uri = normalized_uri
+        else:
+            self.path = _validate_relative_path(path or skill.name)
+            if self.path.split("/")[-1] != skill.name:
+                raise ValueError("The final skill path segment must match Skill.name")
+            self._skill_uri = f"skill://{self.path}/SKILL.md"
+        self.auth = auth
+        self.dynamic = dynamic
+        self.tags = tags or set()
 
     @property
-    def skill_info(self) -> SkillInfo:
-        """Get the loaded skill info."""
-        if self._skill_info is None:
-            raise RuntimeError("Skill not loaded")
-        return self._skill_info
+    def skill_uri(self) -> str:
+        return self._skill_uri
 
-    # -------------------------------------------------------------------------
-    # Provider interface implementation
-    # -------------------------------------------------------------------------
+    def _resources(self) -> list[SkillResource]:
+        return [
+            _resource(
+                self.skill, self.skill_uri, path, self.auth, dynamic=self.dynamic
+            ).model_copy(update={"tags": self.tags})
+            for path in self.skill.files
+        ]
 
     async def _list_resources(self) -> Sequence[Resource]:
-        """List skill resources."""
-        skill = self.skill_info
-        resources: list[Resource] = []
-
-        # Main skill file
-        resources.append(
-            SkillResource(
-                uri=AnyUrl(
-                    f"skill://{skill.name}/{quote(self._main_file_name, safe='/')}"
-                ),
-                name=f"{skill.name}/{self._main_file_name}",
-                description=skill.description,
-                mime_type="text/markdown",
-                skill_info=skill,
-                is_manifest=False,
-            )
-        )
-
-        # Synthetic manifest
-        resources.append(
-            SkillResource(
-                uri=AnyUrl(f"skill://{skill.name}/_manifest"),
-                name=f"{skill.name}/_manifest",
-                description=f"File listing for {skill.name}",
-                mime_type="application/json",
-                skill_info=skill,
-                is_manifest=True,
-            )
-        )
-
-        # If supporting_files="resources", add all supporting files as resources
-        if self._supporting_files == "resources":
-            for file_info in skill.files:
-                # Skip main file and manifest (already added)
-                if file_info.path == self._main_file_name:
-                    continue
-
-                mime_type, _ = mimetypes.guess_type(file_info.path)
-                resources.append(
-                    SkillFileResource(
-                        uri=AnyUrl(
-                            f"skill://{skill.name}/{quote(file_info.path, safe='/')}"
-                        ),
-                        name=f"{skill.name}/{file_info.path}",
-                        description=f"File from {skill.name} skill",
-                        mime_type=mime_type or "application/octet-stream",
-                        skill_info=skill,
-                        file_path=file_info.path,
-                    )
-                )
-
-        return resources
+        return self._resources()
 
     async def _get_resource(
         self, uri: str, version: VersionSpec | None = None
     ) -> Resource | None:
-        """Get a resource by URI."""
-        skill = self.skill_info
-
-        # Parse URI: skill://{skill_name}/{file_path}
-        if not uri.startswith("skill://"):
-            return None
-
-        path_part = uri[len("skill://") :]
-        parts = path_part.split("/", 1)
-        if len(parts) != 2:
-            return None
-
-        skill_name, file_path = parts
-        if skill_name != skill.name:
-            return None
-        file_path = unquote(file_path)
-
-        if file_path == "_manifest":
-            return SkillResource(
-                uri=AnyUrl(uri),
-                name=f"{skill_name}/_manifest",
-                description=f"File listing for {skill_name}",
-                mime_type="application/json",
-                skill_info=skill,
-                is_manifest=True,
-            )
-        elif file_path == self._main_file_name:
-            return SkillResource(
-                uri=AnyUrl(uri),
-                name=f"{skill_name}/{self._main_file_name}",
-                description=skill.description,
-                mime_type="text/markdown",
-                skill_info=skill,
-                is_manifest=False,
-            )
-        elif self._supporting_files == "resources":
-            # Check if it's a known supporting file
-            for file_info in skill.files:
-                if file_info.path == file_path:
-                    mime_type, _ = mimetypes.guess_type(file_path)
-                    return SkillFileResource(
-                        uri=AnyUrl(uri),
-                        name=f"{skill_name}/{file_path}",
-                        description=f"File from {skill_name} skill",
-                        mime_type=mime_type or "application/octet-stream",
-                        skill_info=skill,
-                        file_path=file_path,
-                    )
-
+        for resource in self._resources():
+            if str(resource.uri) == uri:
+                return resource
         return None
 
     async def _list_resource_templates(self) -> Sequence[ResourceTemplate]:
-        """List resource templates for accessing files within the skill."""
-        # Only expose template if supporting_files="template"
-        if self._supporting_files != "template":
-            return []
-
-        skill = self.skill_info
-        return [
-            SkillFileTemplate(
-                uri_template=f"skill://{skill.name}/{{path*}}",
-                name=f"{skill.name}_files",
-                description=f"Access files within {skill.name}",
-                mime_type="application/octet-stream",
-                parameters={
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"],
-                },
-                skill_info=skill,
-            )
-        ]
+        return []
 
     async def _get_resource_template(
         self, uri: str, version: VersionSpec | None = None
     ) -> ResourceTemplate | None:
-        """Get a resource template that matches the given URI."""
-        # Only match if supporting_files="template"
-        if self._supporting_files != "template":
-            return None
+        return None
 
-        skill = self.skill_info
 
-        if not uri.startswith("skill://"):
-            return None
+class SkillCatalogProvider(Provider):
+    """Publish skills loaded from an application-owned catalog.
 
-        path_part = uri[len("skill://") :]
-        parts = path_part.split("/", 1)
-        if len(parts) != 2:
-            return None
+    The callbacks can read from a database, object store, or service. Returning
+    new :class:`SkillPublication` snapshots on each call keeps refresh policy
+    with the application while FastMCP handles resource projection and MCP
+    serialization.
+    """
 
-        skill_name, file_path = parts
-        if skill_name != skill.name:
-            return None
+    def __init__(
+        self,
+        list_publications: Callable[[], Awaitable[Sequence[SkillPublication]]],
+        *,
+        get_publication: Callable[[str], Awaitable[SkillPublication | None]]
+        | None = None,
+    ) -> None:
+        super().__init__()
+        self._list_publications_fn = list_publications
+        self._get_publication_fn = get_publication
 
-        # Don't match known resources (main file, manifest)
-        if file_path == "_manifest" or file_path == self._main_file_name:
-            return None
-
-        return SkillFileTemplate(
-            uri_template=f"skill://{skill.name}/{{path*}}",
-            name=f"{skill.name}_files",
-            description=f"Access files within {skill.name}",
-            mime_type="application/octet-stream",
-            parameters={
-                "type": "object",
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"],
-            },
-            skill_info=skill,
+    @staticmethod
+    def _provider(publication: SkillPublication) -> SkillProvider:
+        auth = (
+            list(publication.auth)
+            if isinstance(publication.auth, tuple)
+            else publication.auth
         )
+        return SkillProvider(
+            publication.skill,
+            path=publication.path,
+            uri=publication.uri,
+            auth=auth,
+            tags=set(publication.tags),
+            dynamic=publication.dynamic,
+        )
+
+    async def _list_resources(self) -> Sequence[Resource]:
+        publications = await self._list_publications_fn()
+        return [
+            resource
+            for publication in publications
+            for resource in self._provider(publication)._resources()
+        ]
+
+    async def _get_resource(
+        self, uri: str, version: VersionSpec | None = None
+    ) -> Resource | None:
+        if self._get_publication_fn is not None:
+            publication = await self._get_publication_fn(uri)
+            if publication is None:
+                return None
+            provider = self._provider(publication)
+            return await provider.get_resource(uri, version)
+        for resource in await self._list_resources():
+            if str(resource.uri) == uri:
+                return resource
+        return None
+
+    async def _list_resource_templates(self) -> Sequence[ResourceTemplate]:
+        return []
+
+    async def _get_resource_template(
+        self, uri: str, version: VersionSpec | None = None
+    ) -> ResourceTemplate | None:
+        return None
+
+
+class SkillsDirectoryProvider(Provider):
+    """Publish immutable skill snapshots discovered below one or more roots.
+
+    Directory contents remain fixed until :meth:`reload` succeeds. ``reload=True``
+    enables development-time rediscovery before each provider request.
+    """
+
+    def __init__(
+        self,
+        roots: str | Path | Sequence[str | Path],
+        *,
+        reload: bool = False,
+        auth: AuthCheck | list[AuthCheck] | None = None,
+        tags: set[str] | None = None,
+    ) -> None:
+        super().__init__()
+        if isinstance(roots, str | Path):
+            roots = [roots]
+        self._roots = tuple(Path(root).resolve() for root in roots)
+        if not self._roots:
+            raise ValueError("SkillsDirectoryProvider requires at least one root")
+        self._reload_enabled = reload
+        self._auth = auth
+        self._tags = tags or set()
+        self._skills: tuple[tuple[str, Skill], ...] = self._scan()
+        self._reload_lock = anyio.Lock()
+
+    def _scan(self) -> tuple[tuple[str, Skill], ...]:
+        result: list[tuple[str, Skill]] = []
+        seen: set[str] = set()
+        for root in self._roots:
+            if not root.is_dir():
+                raise FileNotFoundError(
+                    f"Skills root does not exist or is not a directory: {root}"
+                )
+            for main_file in sorted(root.rglob("SKILL.md")):
+                skill_dir = main_file.parent
+                skill = Skill.from_directory(skill_dir)
+                relative = skill_dir.relative_to(root).as_posix()
+                if relative == ".":
+                    relative = skill.name
+                path = _validate_relative_path(relative)
+                if path.split("/")[-1] != skill.name:
+                    raise ValueError(
+                        f"Skill directory path {path!r} must end in frontmatter name {skill.name!r}"
+                    )
+                if path in seen:
+                    raise ValueError(f"Duplicate skill publication path: {path!r}")
+                seen.add(path)
+                result.append((path, skill))
+        return tuple(result)
+
+    async def reload(self) -> None:
+        """Load and atomically publish a complete new directory generation."""
+        async with self._reload_lock:
+            new_skills = await anyio.to_thread.run_sync(self._scan)
+            self._skills = new_skills
+
+    async def _refresh_if_enabled(self) -> None:
+        if self._reload_enabled:
+            await self.reload()
+
+    def _resources(self) -> list[SkillResource]:
+        resources: list[SkillResource] = []
+        for path, skill in self._skills:
+            root_uri = f"skill://{path}/SKILL.md"
+            resources.extend(
+                _resource(skill, root_uri, file_path, self._auth).model_copy(
+                    update={"tags": self._tags}
+                )
+                for file_path in skill.files
+            )
+        return resources
+
+    async def _list_resources(self) -> Sequence[Resource]:
+        await self._refresh_if_enabled()
+        return self._resources()
+
+    async def _get_resource(
+        self, uri: str, version: VersionSpec | None = None
+    ) -> Resource | None:
+        await self._refresh_if_enabled()
+        for resource in self._resources():
+            if str(resource.uri) == uri:
+                return resource
+        return None
+
+    async def _list_resource_templates(self) -> Sequence[ResourceTemplate]:
+        return []
+
+    async def _get_resource_template(
+        self, uri: str, version: VersionSpec | None = None
+    ) -> ResourceTemplate | None:
+        return None
 
     def __repr__(self) -> str:
-        return (
-            f"SkillProvider(skill_path={self._skill_path!r}, "
-            f"supporting_files={self._supporting_files!r})"
-        )
+        return f"SkillsDirectoryProvider(roots={self._roots!r}, skills={len(self._skills)})"

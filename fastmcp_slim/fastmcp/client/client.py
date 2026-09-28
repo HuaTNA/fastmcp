@@ -66,6 +66,7 @@ from fastmcp.client.messages import MessageHandler, MessageHandlerT
 from fastmcp.client.mixins import (
     ClientPromptsMixin,
     ClientResourcesMixin,
+    ClientSkillsMixin,
     ClientToolsMixin,
 )
 from fastmcp.client.progress import ProgressHandler, default_progress_handler
@@ -262,6 +263,7 @@ class CallToolResult:
 class Client(
     Generic[ClientTransportT],
     ClientResourcesMixin,
+    ClientSkillsMixin,
     ClientPromptsMixin,
     ClientToolsMixin,
 ):
@@ -1230,11 +1232,12 @@ class Client(
         method: str,
         *,
         cursor: str | None,
+        params_key: str = "",
         cache_mode: CacheMode,
         send: Callable[[], Coroutine[Any, Any, CacheableT]],
         absorb: Callable[[CacheableT], CacheableT] | None = None,
     ) -> CacheableT:
-        """Serve one of the cacheable list verbs through the response cache.
+        """Serve a cacheable protocol request through the response cache.
 
         Mirrors the SDK Client's `_cached_fetch`: cursorless `use` calls are served
         from (and stored to) the cache; a cursor page skips the cache (and evicts on
@@ -1259,12 +1262,15 @@ class Client(
                 if e.code == mcp_types.INVALID_PARAMS:
                     await cache.evict_method(method)
                 raise
-        if cache_mode == "use" and (hit := await cache.read(method, "")) is not None:
+        if (
+            cache_mode == "use"
+            and (hit := await cache.read(method, params_key)) is not None
+        ):
             served = cast(CacheableT, hit)
             return served if absorb is None else absorb(served)
-        gen = cache.capture(method, "")
+        gen = cache.capture(method, params_key)
         result = await send()
-        await cache.write(method, "", result, gen, cache_mode)
+        await cache.write(method, params_key, result, gen, cache_mode)
         return result
 
     async def _drive_input_required(

@@ -8,7 +8,7 @@ from unittest.mock import patch
 import mcp_types
 import pytest
 
-from fastmcp import FastMCP
+from fastmcp import FastMCP, Skill
 from fastmcp.cli import client as client_module
 from fastmcp.cli.client import (
     Client,
@@ -26,6 +26,8 @@ from fastmcp.cli.client import (
 )
 from fastmcp.client.client import CallToolResult
 from fastmcp.client.transports.stdio import StdioTransport
+from fastmcp.server.providers.skills import SkillProvider
+from fastmcp.server.skills import SkillsExtension
 
 # ---------------------------------------------------------------------------
 # coerce_value
@@ -469,6 +471,44 @@ class TestListCommandCLI:
         await list_command("fake://server", prompts=True)
         captured = capsys.readouterr()
         assert "ask" in captured.out
+
+    async def test_list_skills(self, capsys: pytest.CaptureFixture[str]):
+        server = FastMCP("skills")
+        server.add_provider(
+            SkillProvider(
+                Skill(
+                    name="refunds",
+                    description="Refund support.",
+                    instructions="Check policy.",
+                )
+            )
+        )
+        server.add_extension(SkillsExtension())
+        with (
+            patch.object(client_module, "resolve_server_spec", return_value="fake"),
+            patch.object(client_module, "_build_client", return_value=Client(server)),
+        ):
+            await list_command("fake://server", skills=True)
+        assert "refunds" in capsys.readouterr().out
+
+    async def test_list_skills_json(self, capsys: pytest.CaptureFixture[str]):
+        server = FastMCP("skills")
+        server.add_provider(
+            SkillProvider(
+                Skill(
+                    name="refunds",
+                    description="Refund support.",
+                    instructions="Check policy.",
+                )
+            )
+        )
+        server.add_extension(SkillsExtension())
+        with (
+            patch.object(client_module, "resolve_server_spec", return_value="fake"),
+            patch.object(client_module, "_build_client", return_value=Client(server)),
+        ):
+            await list_command("fake://server", skills=True, json_output=True)
+        assert json.loads(capsys.readouterr().out)["skills"][0]["name"] == "refunds"
 
 
 class TestCallCommandCLI:

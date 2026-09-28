@@ -8,6 +8,7 @@ try:
         PrivateKeyJWTOAuthProvider,
     )
     from .client import Client
+    from .skills import RemoteSkill, SkillContent
     from .transports import (
         ClientTransport,
         FastMCPTransport,
@@ -34,7 +35,9 @@ __all__ = [
     "OAuth",
     "PrivateKeyJWTOAuthProvider",
     "PythonStdioTransport",
+    "RemoteSkill",
     "SSETransport",
+    "SkillContent",
     "StdioTransport",
     "StreamableHttpTransport",
     "UvStdioTransport",

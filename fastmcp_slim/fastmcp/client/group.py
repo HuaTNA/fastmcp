@@ -15,6 +15,7 @@ import mcp_types
 from mcp.client.caching import CacheMode
 
 from fastmcp.client.client import CallToolResult, Client, ConnectMode
+from fastmcp.client.mixins.skills import RemoteSkill
 from fastmcp.client.progress import ProgressHandler
 from fastmcp.mcp_config import MCPConfig
 from fastmcp.utilities.async_utils import gather
@@ -95,6 +96,42 @@ class ClientGroup:
     @property
     def protocol_versions(self) -> dict[str, str | None]:
         return {name: client.protocol_version for name, client in self._clients.items()}
+
+    async def list_skills(
+        self, *, cache_mode: CacheMode = "use"
+    ) -> dict[str, list[RemoteSkill]]:
+        """List skills from each connected server, preserving their origins."""
+        self._require_connected()
+        results = await gather(
+            (
+                client.list_skills(cache_mode=cache_mode)
+                for client in self._clients.values()
+            ),
+            return_exceptions=True,
+        )
+        mapped: dict[str, list[RemoteSkill]] = {}
+        for (server_name, _), result in zip(
+            self._clients.items(), results, strict=True
+        ):
+            if isinstance(result, BaseException):
+                raise result
+            mapped[server_name] = [skill._with_origin(server_name) for skill in result]
+        return mapped
+
+    async def get_skill(
+        self, server_name: str, uri: str, *, cache_mode: CacheMode = "use"
+    ) -> RemoteSkill:
+        """Fetch a skill by its URI from the named origin."""
+        try:
+            client = self._clients[server_name]
+        except KeyError as exc:
+            raise KeyError(f"Unknown ClientGroup server {server_name!r}") from exc
+        if not client.is_connected():
+            raise RuntimeError(
+                f"ClientGroup client for {server_name!r} is not connected"
+            )
+        skill = await client.get_skill(uri, cache_mode=cache_mode)
+        return skill._with_origin(server_name)
 
     async def __aenter__(self) -> ClientGroup:
         async with self._lifecycle_lock:

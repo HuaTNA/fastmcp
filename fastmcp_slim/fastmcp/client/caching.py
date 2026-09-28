@@ -47,6 +47,7 @@ from mcp.client.caching import CacheEntry, CacheKey
 from mcp_types import CacheableResult
 from mcp_types.methods import MONOLITH_RESULTS
 
+from fastmcp.skills import GetSkillResult, ListSkillsResult
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.types import FastMCPBaseModel
 
@@ -74,6 +75,12 @@ def _cacheable_result_models() -> dict[str, type[CacheableResult]]:
 
 
 CACHEABLE_RESULT_MODELS = _cacheable_result_models()
+CACHEABLE_RESULT_MODELS.update(
+    {
+        GetSkillResult.__name__: GetSkillResult,
+        ListSkillsResult.__name__: ListSkillsResult,
+    }
+)
 """Type tag -> model class allowlist for envelope reconstruction."""
 
 

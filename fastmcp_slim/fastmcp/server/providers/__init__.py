@@ -33,8 +33,9 @@ from fastmcp.server.providers.fastmcp_provider import FastMCPProvider
 from fastmcp.server.providers.filesystem import FileSystemProvider
 from fastmcp.server.providers.local_provider import LocalProvider
 from fastmcp.server.providers.skills import (
-    ClaudeSkillsProvider,
+    SkillCatalogProvider,
     SkillProvider,
+    SkillPublication,
     SkillsDirectoryProvider,
 )
 
@@ -44,14 +45,15 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AggregateProvider",
-    "ClaudeSkillsProvider",
     "FastMCPProvider",
     "FileSystemProvider",
     "LocalProvider",
     "OpenAPIProvider",
     "Provider",
     "ProxyProvider",
+    "SkillCatalogProvider",
     "SkillProvider",
+    "SkillPublication",
     "SkillsDirectoryProvider",
 ]
 
