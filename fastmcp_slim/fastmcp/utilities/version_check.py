@@ -38,9 +38,20 @@ def _read_cache(include_prereleases: bool = False) -> tuple[str | None, float]:
 
     try:
         data = json.loads(cache_path.read_text())
-        return data.get("latest_version"), data.get("timestamp", 0)
     except (json.JSONDecodeError, OSError):
         return None, 0
+
+    if not isinstance(data, dict):
+        return None, 0
+    latest_version = data.get("latest_version")
+    timestamp = data.get("timestamp", 0)
+    if (
+        not isinstance(latest_version, str)
+        or isinstance(timestamp, bool)
+        or not isinstance(timestamp, int | float)
+    ):
+        return None, 0
+    return latest_version, timestamp
 
 
 def _write_cache(latest_version: str, include_prereleases: bool = False) -> None:

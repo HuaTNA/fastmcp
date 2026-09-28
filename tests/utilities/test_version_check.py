@@ -73,6 +73,32 @@ class TestReadCache:
         assert version is None
         assert timestamp == 0
 
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"latest_version": "4.0.0", "timestamp": "invalid"},
+            {"latest_version": "4.0.0", "timestamp": None},
+            {"latest_version": "4.0.0", "timestamp": True},
+            {"latest_version": 4, "timestamp": 1000},
+            ["4.0.0", 1000],
+            "4.0.0",
+        ],
+    )
+    def test_read_cache_malformed_entry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: object
+    ):
+        """A well-formed JSON file with the wrong shape is ignored."""
+        cache_file = tmp_path / "version_cache.json"
+        cache_file.write_text(json.dumps(payload))
+        monkeypatch.setattr(
+            "fastmcp.utilities.version_check._get_cache_path",
+            lambda include_prereleases=False: cache_file,
+        )
+
+        version, timestamp = _read_cache()
+        assert version is None
+        assert timestamp == 0
+
 
 class TestWriteCache:
     def test_write_cache_creates_file(
@@ -221,6 +247,27 @@ class TestGetLatestVersion:
         ):
             version = get_latest_version()
             assert version == "2.4.0"
+
+    def test_fetches_if_cache_timestamp_malformed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A nonnumeric cache timestamp is ignored rather than crashing."""
+        cache_file = tmp_path / "version_cache.json"
+        cache_file.write_text(
+            json.dumps({"latest_version": "2.4.0", "timestamp": "invalid"})
+        )
+        monkeypatch.setattr(
+            "fastmcp.utilities.version_check._get_cache_path",
+            lambda include_prereleases=False: cache_file,
+        )
+
+        with patch(
+            "fastmcp.utilities.version_check._fetch_latest_version",
+            return_value="2.5.0",
+        ) as mock_fetch:
+            version = get_latest_version()
+            assert version == "2.5.0"
+            mock_fetch.assert_called_once()
 
 
 class TestCheckForNewerVersion:
