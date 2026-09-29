@@ -40,6 +40,17 @@ repos:
         pass_filenames: false
         verbose: true
 
+      - id: gitleaks
+        name: gitleaks (secret scanning)
+        # Full working-tree scan rather than the official `gitleaks git --staged`
+        # hook: that mode fingerprints findings by commit SHA, which churns
+        # .gitleaksignore entries on every unrelated commit to an ignored file.
+        # `detect --no-git` fingerprints by file:rule:line instead, so ignores
+        # stay stable. Requires gitleaks on PATH (e.g. `brew install gitleaks`).
+        entry: gitleaks detect --source . --no-git --redact -v
+        language: system
+        pass_filenames: false
+
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
