@@ -18,6 +18,11 @@ paths = [
   '''(^|/)dist/''',
   '''(^|/)build/''',
   '''(^|/)\.pytest_cache/''',
+  # Local env files are gitignored and routinely hold real credentials for
+  # whatever provider a developer is testing against - never git-controlled,
+  # so there's nothing here for the scan to protect against committing.
+  '''(^|/)\.env($|\.)''',
+  '''(^|/)\.direnv/''',
 ]
 
 # Matched against the detected secret text itself, not file:line - stable
